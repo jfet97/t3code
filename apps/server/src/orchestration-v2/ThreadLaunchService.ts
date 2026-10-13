@@ -201,6 +201,11 @@ function failureDetail(error: unknown): string {
   return `Workspace preparation failed: ${error instanceof Error ? error.message : String(error)}`;
 }
 
+/** Whether `run` still needs its workspace; a run held for pre-start monitors stays preparing after it. */
+function awaitsPreparation(run: OrchestrationV2ThreadProjection["runs"][number]): boolean {
+  return run.status === "preparing" && run.preStart?.workspaceReady !== true;
+}
+
 const make = Effect.gen(function* () {
   const projects = yield* ProjectService.ProjectService;
   const setupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
@@ -929,7 +934,7 @@ const make = Effect.gen(function* () {
           .pipe(Effect.mapError(mapError(input, "create-thread", threadId)));
         const runIsPreparing =
           runId !== null &&
-          projection.runs.some((run) => run.id === runId && run.status === "preparing");
+          projection.runs.some((run) => run.id === runId && awaitsPreparation(run));
         const shouldSchedule = runId === null ? Option.isNone(launchReceipt) : runIsPreparing;
         // A retried root launch prepares the folder its first attempt bound, so
         // a Scratch thread keeps its own. Other root launches bind no folder.
@@ -953,7 +958,7 @@ const make = Effect.gen(function* () {
                   ? true
                   : yield* threads.getThreadRecords(threadId, ["runs"], { runIds: [runId] }).pipe(
                       Effect.map((current) =>
-                        current.runs.some((run) => run.id === runId && run.status === "preparing"),
+                        current.runs.some((run) => run.id === runId && awaitsPreparation(run)),
                       ),
                       Effect.mapError(mapError(input, "update-thread", threadId)),
                     );
@@ -996,7 +1001,8 @@ const make = Effect.gen(function* () {
       const projection = yield* threads.getThreadProjection(input.threadId);
       const run = projection.runs.find((candidate) => candidate.id === input.runId);
       const workspacePreparation = run?.workspacePreparation;
-      if (run?.status !== "preparing" || workspacePreparation === undefined) return;
+      if (run === undefined || !awaitsPreparation(run) || workspacePreparation === undefined)
+        return;
       if (!(yield* reservePreparation(input.commandId))) return;
       yield* scheduleRetriedPreparation(input, projection, run, workspacePreparation).pipe(
         Effect.onError(() => releasePreparation(input.commandId)),

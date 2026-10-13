@@ -6,6 +6,7 @@ import * as SchemaGetter from "effect/SchemaGetter";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
+  AuthSessionId,
   CheckpointId,
   CheckpointRef,
   CheckpointScopeId,
@@ -540,6 +541,28 @@ export type OrchestrationV2ThreadLaunchWorkspaceStrategy =
 /** Failure code on the error item a failed workspace preparation leaves. */
 export const ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE = "workspace_preparation_failed";
 
+/** What a pre-start monitor adds for a held run's first provider turn. */
+export const OrchestrationV2PreStartContext = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(8_000),
+);
+
+/**
+ * A new thread's first message held for pre-start monitors (see `subscribePreStart`).
+ * The run stays `preparing` until a monitor responds or `expiresAt` passes; only
+ * then does its first provider turn start.
+ */
+export const OrchestrationV2RunPreStart = Schema.Struct({
+  /** The first message's command. A response or the expiry must name it to end this wait. */
+  requestId: CommandId,
+  expiresAt: IsoDateTime,
+  status: Schema.Literals(["pending", "released", "expired"]),
+  /** False while a launch still prepares the run's workspace. */
+  workspaceReady: Schema.Boolean,
+  /** Sent ahead of the user's message in the first provider turn. */
+  context: Schema.optional(OrchestrationV2PreStartContext),
+});
+export type OrchestrationV2RunPreStart = typeof OrchestrationV2RunPreStart.Type;
+
 export const OrchestrationV2Run = Schema.Struct({
   id: RunId,
   threadId: ThreadId,
@@ -585,6 +608,7 @@ export const OrchestrationV2Run = Schema.Struct({
   delegatedCompletion: Schema.optional(OrchestrationV2DelegatedCompletionCohort),
   /** How a launch prepares this run's workspace; prepared-run.retry repeats it. */
   workspacePreparation: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
+  preStart: Schema.optional(OrchestrationV2RunPreStart),
 });
 export type OrchestrationV2Run = typeof OrchestrationV2Run.Type;
 
@@ -3242,6 +3266,25 @@ const OrchestrationV2InternalCommand = Schema.Union([
     placeholder: Schema.optional(Schema.String),
     secretStatus: OrchestrationV2SecretRequestStatus,
   }),
+  /**
+   * Ends a held first run's wait for pre-start monitors: with a subscribed monitor's
+   * `response`, or without one at expiry. Rejected once the wait for `requestId` has
+   * ended, so a late or repeated answer changes nothing.
+   */
+  Schema.Struct({
+    type: Schema.Literal("run.pre-start.settle"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+    requestId: CommandId,
+    response: Schema.optional(
+      Schema.Struct({
+        sessionId: AuthSessionId,
+        subscriptionId: TrimmedNonEmptyString,
+        context: Schema.optional(OrchestrationV2PreStartContext),
+      }),
+    ),
+  }),
 ]);
 export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalCommand.Type;
 
@@ -3264,6 +3307,8 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   subscribeArchivedShell: "orchestration.subscribeArchivedShell",
   subscribeShell: "orchestration.subscribeShell",
   subscribeThread: "orchestration.subscribeThread",
+  subscribePreStart: "orchestration.subscribePreStart",
+  respondPreStart: "orchestration.respondPreStart",
 } as const;
 
 export const OrchestrationV2ArchivedShellSnapshot = Schema.Struct({
@@ -3370,6 +3415,51 @@ export const OrchestrationV2SubscribeThreadInput = Schema.Struct({
   acceptCompactTurnItems: Schema.optionalKey(Schema.Boolean),
 });
 export type OrchestrationV2SubscribeThreadInput = typeof OrchestrationV2SubscribeThreadInput.Type;
+
+/**
+ * Subscribing makes the connection a pre-start monitor. While any monitor is subscribed, a
+ * new thread's first message waits in `preparing` for up to `holdMs` before its provider
+ * turn starts, so a monitor can add context with `respondPreStart`.
+ */
+export const OrchestrationV2SubscribePreStartInput = Schema.Struct({
+  /** How long a held run waits for this monitor; the server bounds it. */
+  holdMs: Schema.optionalKey(PositiveInt),
+});
+export type OrchestrationV2SubscribePreStartInput =
+  typeof OrchestrationV2SubscribePreStartInput.Type;
+
+export const OrchestrationV2PreStartStreamItem = Schema.Union([
+  /** Runs are held for this subscription from here on. */
+  Schema.Struct({
+    kind: Schema.Literal("ready"),
+    subscriptionId: TrimmedNonEmptyString,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("held"),
+    threadId: ThreadId,
+    runId: RunId,
+    messageId: MessageId,
+    requestId: CommandId,
+    expiresAt: IsoDateTime,
+    text: Schema.String,
+  }),
+]);
+export type OrchestrationV2PreStartStreamItem = typeof OrchestrationV2PreStartStreamItem.Type;
+
+export const OrchestrationV2RespondPreStartInput = Schema.Struct({
+  subscriptionId: TrimmedNonEmptyString,
+  threadId: ThreadId,
+  runId: RunId,
+  requestId: CommandId,
+  context: Schema.optionalKey(OrchestrationV2PreStartContext),
+});
+export type OrchestrationV2RespondPreStartInput = typeof OrchestrationV2RespondPreStartInput.Type;
+
+export const OrchestrationV2RespondPreStartResult = Schema.Struct({
+  /** False once the wait has ended: answered, expired, stopped or archived. */
+  accepted: Schema.Boolean,
+});
+export type OrchestrationV2RespondPreStartResult = typeof OrchestrationV2RespondPreStartResult.Type;
 
 export const OrchestrationV2ThreadDetailSnapshot = Schema.Struct({
   snapshotSequence: NonNegativeInt,
@@ -3745,6 +3835,15 @@ export class OrchestrationV2SearchThreadError extends Schema.TaggedError<Orchest
   }
 }
 
+export class OrchestrationV2PreStartError extends Schema.TaggedError<OrchestrationV2PreStartError>()(
+  "OrchestrationV2PreStartError",
+  { cause: Schema.Defect() },
+) {
+  override get message(): string {
+    return "Pre-start monitoring failed. Please retry.";
+  }
+}
+
 export const OrchestrationV2RpcSchemas = {
   searchThread: {
     input: OrchestrationV2SearchThreadInput,
@@ -3797,6 +3896,14 @@ export const OrchestrationV2RpcSchemas = {
   subscribeThread: {
     input: OrchestrationV2SubscribeThreadInput,
     output: OrchestrationV2ThreadStreamItem,
+  },
+  subscribePreStart: {
+    input: OrchestrationV2SubscribePreStartInput,
+    output: OrchestrationV2PreStartStreamItem,
+  },
+  respondPreStart: {
+    input: OrchestrationV2RespondPreStartInput,
+    output: OrchestrationV2RespondPreStartResult,
   },
 } as const;
 

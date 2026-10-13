@@ -11,6 +11,7 @@ import { assert, it, vi } from "@effect/vitest";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
+  AuthSessionId,
   ChatAttachmentId,
   ComposerContextId,
   type ChatAttachment,
@@ -22,6 +23,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   OrchestrationV2ThreadProjectionJson,
+  type OrchestrationV2PreStartStreamItem,
   ScheduledTaskId,
   type ServerProvider,
   ThreadId,
@@ -34,6 +36,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
@@ -53,7 +56,10 @@ import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import * as EffectWorker from "./EffectWorker.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
+import * as PreStartMonitors from "./PreStartMonitors.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
@@ -242,6 +248,7 @@ function makeHarness(options: HarnessOptions = {}) {
       layerOutbox,
       layerDatabase,
       layerExternalServices,
+      layerOrchestrator,
     ),
     createWorktree,
     removeWorktree,
@@ -2704,4 +2711,377 @@ it.effect("replays an accepted message.dispatch after the project disables the i
       assert.fail(`expected ThreadManagementProviderInstanceDisabledError, got ${fresh._tag}`);
     }
   }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
+});
+
+const monitorSessionId = AuthSessionId.make("session:pre-start-monitor");
+
+/** Subscribes as a pre-start monitor; runs are held for it once this returns. */
+const subscribePreStart = Effect.gen(function* () {
+  const monitors = yield* PreStartMonitors.PreStartMonitors;
+  const items = yield* Queue.unbounded<OrchestrationV2PreStartStreamItem>();
+  yield* monitors.subscribe({ sessionId: monitorSessionId }).pipe(
+    Stream.runForEach((item) => Queue.offer(items, item)),
+    Effect.forkScoped,
+  );
+  const ready = yield* Queue.take(items);
+  if (ready.kind !== "ready") return assert.fail("A subscription starts with its ready frame.");
+  return {
+    subscriptionId: ready.subscriptionId,
+    held: Queue.take(items).pipe(
+      Effect.map((item) => (item.kind === "held" ? item : assert.fail("Expected a held run."))),
+    ),
+  };
+});
+
+function firstMessage(threadId: ThreadId, command: string) {
+  return {
+    type: "message.dispatch" as const,
+    commandId: CommandId.make(command),
+    threadId,
+    messageId: MessageId.make(`${command}:message`),
+    text: "Fix the login bug",
+    attachments: [],
+    dispatchMode: { type: "start_immediately" as const },
+    createdBy: "user" as const,
+    creationSource: "web" as const,
+  };
+}
+
+it.effect("holds a launched thread's first message until a pre-start monitor answers", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const monitor = yield* subscribePreStart;
+    const input = launchInput({
+      command: "launch:pre-start",
+      thread: "thread:pre-start",
+      message: "Fix the login bug",
+    });
+    const launched = yield* launches.launch(input);
+    const held = yield* monitor.held;
+    assert.equal(held.threadId, launched.threadId);
+    assert.equal(held.text, "Fix the login bug");
+
+    // the workspace is ready, but the run still waits for the monitor
+    yield* waitUntil(() =>
+      threads
+        .getThreadProjection(launched.threadId)
+        .pipe(Effect.map((projection) => projection.runs[0]?.preStart?.workspaceReady === true)),
+    );
+    assert.equal(
+      (yield* threads.getThreadProjection(launched.threadId)).runs[0]?.status,
+      "preparing",
+    );
+    assert.isEmpty(yield* outbox.listByCommandId(CommandId.make(`${input.commandId}:release`)));
+
+    const answer = {
+      sessionId: monitorSessionId,
+      subscriptionId: monitor.subscriptionId,
+      threadId: held.threadId,
+      runId: held.runId,
+      requestId: held.requestId,
+      context: "Propose a plan before editing files.",
+    };
+    assert.isTrue((yield* threads.respondPreStart(answer)).accepted);
+    const projection = yield* threads.getThreadProjection(launched.threadId);
+    assert.equal(projection.runs[0]?.id, held.runId);
+    assert.equal(projection.runs[0]?.status, "starting");
+    assert.equal(projection.runs[0]?.preStart?.status, "released");
+    assert.equal(projection.runs[0]?.preStart?.context, "Propose a plan before editing files.");
+    assert.equal(projection.messages[0]?.text, "Fix the login bug");
+    const expiry = (yield* outbox.listByCommandId(held.requestId)).find(
+      (effect) => effect.request.type === "run.pre-start.expire",
+    );
+    assert.equal(expiry?.status, "cancelled");
+    // the cancelled expiry no longer holds back the original run's provider turn
+    const next = yield* outbox.claimNext({ workerId: "test", leaseDurationMs: 1_000 });
+    assert.deepEqual(Option.getOrUndefined(next)?.request, {
+      type: "provider-turn.start",
+      runId: held.runId,
+    });
+
+    // once the wait has ended, another monitor's answer changes nothing
+    const late = yield* subscribePreStart;
+    assert.isFalse(
+      (yield* threads.respondPreStart({ ...answer, subscriptionId: late.subscriptionId })).accepted,
+    );
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("releases a held first message unchanged when no monitor answers in time", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+    const created = yield* launches.launch(
+      launchInput({ command: "launch:pre-start-expiry", thread: "thread:pre-start-expiry" }),
+    );
+    const monitor = yield* subscribePreStart;
+    const message = firstMessage(created.threadId, "command:pre-start-expiry");
+    yield* threads.dispatch(message);
+    const held = yield* monitor.held;
+    assert.deepEqual(
+      (yield* outbox.listByCommandId(message.commandId)).map((effect) => effect.request.type),
+      ["run.pre-start.expire"],
+    );
+
+    // a client release cannot start a run that still waits for monitors
+    const release = CommandId.make("command:pre-start-expiry:release");
+    yield* threads.dispatch({
+      type: "prepared-run.release",
+      commandId: release,
+      threadId: created.threadId,
+      runId: held.runId,
+    });
+    assert.equal(
+      (yield* threads.getThreadProjection(created.threadId)).runs[0]?.status,
+      "preparing",
+    );
+    assert.isEmpty(yield* outbox.listByCommandId(release));
+
+    yield* TestClock.adjust(Duration.seconds(11));
+    assert.isTrue(yield* worker.runOnce);
+    const run = (yield* threads.getThreadProjection(created.threadId)).runs[0];
+    assert.equal(run?.status, "starting");
+    assert.equal(run?.preStart?.status, "expired");
+    assert.isUndefined(run?.preStart?.context);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("stops a held first message without starting it", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const created = yield* launches.launch(
+      launchInput({ command: "launch:pre-start-stop", thread: "thread:pre-start-stop" }),
+    );
+    const monitor = yield* subscribePreStart;
+    const message = firstMessage(created.threadId, "command:pre-start-stop");
+    yield* threads.dispatch(message);
+    const held = yield* monitor.held;
+
+    yield* threads.dispatch({
+      type: "run.interrupt",
+      commandId: CommandId.make("command:pre-start-stop:interrupt"),
+      threadId: created.threadId,
+      runId: held.runId,
+    });
+    assert.equal(
+      (yield* threads.getThreadProjection(created.threadId)).runs[0]?.status,
+      "interrupted",
+    );
+    assert.deepEqual(
+      (yield* outbox.listByCommandId(message.commandId)).map((effect) => effect.status),
+      ["cancelled"],
+    );
+    assert.isFalse(
+      (yield* threads.respondPreStart({
+        sessionId: monitorSessionId,
+        subscriptionId: monitor.subscriptionId,
+        threadId: held.threadId,
+        runId: held.runId,
+        requestId: held.requestId,
+      })).accepted,
+    );
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("starts a first message at once without a monitor, or when an agent sends it", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const unmonitored = yield* launches.launch(
+      launchInput({ command: "launch:pre-start-none", thread: "thread:pre-start-none" }),
+    );
+    yield* threads.dispatch(firstMessage(unmonitored.threadId, "command:pre-start-none"));
+    const unmonitoredRun = (yield* threads.getThreadProjection(unmonitored.threadId)).runs[0];
+    assert.equal(unmonitoredRun?.status, "starting");
+    assert.isUndefined(unmonitoredRun?.preStart);
+
+    yield* subscribePreStart;
+    const delegated = yield* launches.launch(
+      launchInput({ command: "launch:pre-start-agent", thread: "thread:pre-start-agent" }),
+    );
+    yield* threads.dispatch({
+      ...firstMessage(delegated.threadId, "command:pre-start-agent"),
+      createdBy: "agent",
+      creationSource: "mcp",
+    });
+    const delegatedRun = (yield* threads.getThreadProjection(delegated.threadId)).runs[0];
+    assert.equal(delegatedRun?.status, "starting");
+    assert.isUndefined(delegatedRun?.preStart);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("accepts a pre-start answer only from its open subscription before the deadline", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const created = yield* launches.launch(
+      launchInput({ command: "launch:pre-start-late", thread: "thread:pre-start-late" }),
+    );
+    const monitor = yield* subscribePreStart;
+    yield* threads.dispatch(firstMessage(created.threadId, "command:pre-start-late"));
+    const held = yield* monitor.held;
+    const answer = {
+      sessionId: monitorSessionId,
+      subscriptionId: monitor.subscriptionId,
+      threadId: held.threadId,
+      runId: held.runId,
+      requestId: held.requestId,
+      context: "Propose a plan before editing files.",
+    };
+
+    assert.isFalse(
+      (yield* threads.respondPreStart({
+        ...answer,
+        sessionId: AuthSessionId.make("session:other"),
+      })).accepted,
+    );
+    assert.equal(
+      (yield* threads.getThreadProjection(created.threadId)).runs[0]?.status,
+      "preparing",
+    );
+
+    // past the deadline, an answer releases the run without its context
+    yield* TestClock.adjust(Duration.seconds(11));
+    assert.isFalse((yield* threads.respondPreStart(answer)).accepted);
+    const run = (yield* threads.getThreadProjection(created.threadId)).runs[0];
+    assert.equal(run?.status, "starting");
+    assert.equal(run?.preStart?.status, "expired");
+    assert.isUndefined(run?.preStart?.context);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("does not start an archived thread after a monitor answered its first message", () =>
+  Effect.gen(function* () {
+    const setupEntered = yield* Deferred.make<void>();
+    const allowSetup = yield* Deferred.make<void>();
+    const harness = makeHarness({
+      runSetup: () =>
+        Deferred.succeed(setupEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(allowSetup)),
+          Effect.as({ status: "no-script" as const }),
+        ),
+    });
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const tracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const monitor = yield* subscribePreStart;
+      const input = launchInput({
+        command: "launch:pre-start-archive",
+        thread: "thread:pre-start-archive",
+        message: "Fix the login bug",
+        workspace: { type: "worktree", baseRef: "main" },
+      });
+      const launched = yield* launches.launch(input);
+      const held = yield* monitor.held;
+      yield* Deferred.await(setupEntered);
+      assert.isTrue(
+        (yield* threads.respondPreStart({
+          sessionId: monitorSessionId,
+          subscriptionId: monitor.subscriptionId,
+          threadId: held.threadId,
+          runId: held.runId,
+          requestId: held.requestId,
+        })).accepted,
+      );
+      assert.equal(
+        (yield* threads.getThreadProjection(launched.threadId)).runs[0]?.status,
+        "preparing",
+      );
+
+      yield* threads.dispatch({
+        type: "thread.archive",
+        commandId: CommandId.make("command:pre-start-archive:archive"),
+        threadId: launched.threadId,
+      });
+      yield* Deferred.succeed(allowSetup, undefined);
+      yield* waitUntil(() =>
+        tracker.get(launched.threadId).pipe(Effect.map((snapshot) => snapshot?.phase === "failed")),
+      );
+      const projection = yield* threads.getThreadProjection(launched.threadId);
+      assert.equal(projection.runs[0]?.status, "cancelled");
+      // the preparation item does not linger as running background work
+      assert.equal(
+        projection.turnItems.find((item) => item.type === "command_execution")?.status,
+        "cancelled",
+      );
+      assert.isEmpty(yield* outbox.listByCommandId(CommandId.make(`${input.commandId}:release`)));
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect("prepares a held first run again when its failed preparation is retried", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const monitor = yield* subscribePreStart;
+    const input = launchInput({
+      command: "launch:pre-start-retry",
+      thread: "thread:pre-start-retry",
+      message: "Fix the login bug",
+    });
+    const launched = yield* launches.launch(input);
+    const held = yield* monitor.held;
+    const preStartOf = threads
+      .getThreadProjection(launched.threadId)
+      .pipe(Effect.map((projection) => projection.runs[0]?.preStart));
+    yield* waitUntil(() =>
+      preStartOf.pipe(Effect.map((preStart) => preStart?.workspaceReady === true)),
+    );
+
+    yield* threads.dispatch({
+      type: "prepared-run.fail",
+      commandId: CommandId.make("command:pre-start-retry:fail"),
+      threadId: launched.threadId,
+      runId: held.runId,
+      failure: makeProviderFailure({ message: "Setup failed.", class: "validation_error" }),
+    });
+    // an archived thread takes no monitor context, even for a failed run
+    yield* threads.dispatch({
+      type: "thread.archive",
+      commandId: CommandId.make("command:pre-start-retry:archive"),
+      threadId: launched.threadId,
+    });
+    assert.isFalse(
+      (yield* threads.respondPreStart({
+        sessionId: monitorSessionId,
+        subscriptionId: monitor.subscriptionId,
+        threadId: held.threadId,
+        runId: held.runId,
+        requestId: held.requestId,
+        context: "Propose a plan before editing files.",
+      })).accepted,
+    );
+    yield* threads.dispatch({
+      type: "thread.unarchive",
+      commandId: CommandId.make("command:pre-start-retry:unarchive"),
+      threadId: launched.threadId,
+    });
+
+    // the retry prepares the workspace again instead of trusting the failed attempt's
+    yield* launches.retryPreparation({
+      commandId: CommandId.make("command:pre-start-retry:retry"),
+      threadId: launched.threadId,
+      runId: held.runId,
+    });
+    yield* waitUntil(() =>
+      preStartOf.pipe(Effect.map((preStart) => preStart?.workspaceReady === true)),
+    );
+    const preStart = yield* preStartOf;
+    assert.equal(preStart?.status, "pending");
+    assert.equal(harness.runSetup.mock.calls.length, 2);
+  }).pipe(Effect.provide(harness.layer));
 });

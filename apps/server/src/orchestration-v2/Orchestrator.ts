@@ -43,6 +43,7 @@ import {
   type OrchestrationV2ProviderTurn,
   type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
+  type OrchestrationV2RunPreStart,
   type OrchestrationV2ThreadShell,
   type OrchestrationV2ThreadShellSnapshot,
   type OrchestrationV2StoredEvent,
@@ -116,6 +117,7 @@ import { ProviderAdapterRegistryV2 } from "./ProviderAdapterRegistry.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as RunExecutionService from "./RunExecutionService.ts";
+import * as PreStartMonitors from "./PreStartMonitors.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
 import { isAutomaticCompletionRun, queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
@@ -432,6 +434,27 @@ function isGoalCommand(message: {
   return message.attachments.length === 0 && /^\/goal(?:\s|$)/u.test(message.text.trim());
 }
 
+/**
+ * A person's first message in a new conversation: the only run pre-start monitors hold.
+ * Agent, scheduled, forked, imported and slash-command starts never wait.
+ */
+function isFirstHumanSubmission(
+  command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
+  projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "providerThreads">,
+): boolean {
+  return (
+    command.createdBy === "user" &&
+    command.scheduledTaskId === undefined &&
+    command.senderThreadId === undefined &&
+    // context ahead of a slash command would stop the provider from expanding it
+    !command.text.trimStart().startsWith("/") &&
+    projection.runs.length === 0 &&
+    projection.thread.lineage.relationshipToParent === null &&
+    projection.thread.historyOrigin !== "v1_import" &&
+    projection.providerThreads.every((providerThread) => providerThread.nativeThreadRef === null)
+  );
+}
+
 const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLinkedPullRequest));
 
 function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
@@ -470,6 +493,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "prepared-run.progress":
     case "prepared-run.fail":
     case "prepared-run.retry":
+    case "run.pre-start.settle":
     case "subagent.stop":
     case "run.interrupt":
     case "queued-message.promote-to-steer":
@@ -837,6 +861,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
   const providerSessions = yield* ProviderSessionManagerV2;
   const providerSwitchService = yield* ProviderSwitchServiceV2;
+  // without pre-start monitors no first run is ever held
+  const preStartMonitors = yield* Effect.serviceOption(PreStartMonitors.PreStartMonitors);
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const runtimePolicy = yield* RuntimePolicyV2;
   const threadForkService = yield* ThreadForkServiceV2;
@@ -3327,7 +3353,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
       const emitEvent = emit(events, command);
       const activeRunIds = new Set(
-        projection.runs.filter((run) => run.status === "queued").map((run) => run.id),
+        projection.runs
+          .filter(
+            (run) =>
+              run.status === "queued" ||
+              // a first run held for monitors would otherwise start once its wait or workspace ends
+              (run.status === "preparing" && run.preStart !== undefined),
+          )
+          .map((run) => run.id),
       );
       for (const run of projection.runs.filter((candidate) => activeRunIds.has(candidate.id))) {
         yield* emitEvent({
@@ -3370,6 +3403,41 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           providerInstanceId: run.providerInstanceId,
           occurredAt: now,
           payload: { ...node, status: "cancelled", completedAt: now },
+        });
+      }
+      // a cancelled held run's preparation item would otherwise stay running as background work
+      for (const run of projection.runs.filter(
+        (candidate) => activeRunIds.has(candidate.id) && candidate.status === "preparing",
+      )) {
+        const { turnItems } = yield* loadProjectionForCommand(command, ["turnItems"], {
+          turnItemTypes: ["command_execution"],
+          turnItemRunId: run.id,
+        });
+        const preparationItem = turnItems.find(
+          (
+            candidate,
+          ): candidate is Extract<
+            OrchestrationV2TurnItem,
+            { readonly type: "command_execution" }
+          > =>
+            candidate.type === "command_execution" &&
+            candidate.input === WORKSPACE_PREPARATION_INPUT &&
+            candidate.status === "running",
+        );
+        if (preparationItem === undefined) continue;
+        yield* emitEvent({
+          type: "turn-item.updated",
+          threadId: command.threadId,
+          runId: run.id,
+          providerInstanceId: run.providerInstanceId,
+          occurredAt: now,
+          payload: {
+            ...preparationItem,
+            status: "cancelled",
+            title: "Workspace preparation cancelled",
+            completedAt: now,
+            updatedAt: now,
+          },
         });
       }
       yield* disposeAllDelegatedCompletionCohorts({
@@ -5296,6 +5364,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         pendingMergeBackTransfer === undefined &&
         !isProviderSwitch
       ) {
+        // a person's first message waits for subscribed pre-start monitors, like a launch
+        // waits for its workspace, and only the settle command starts it
+        const preStartHold =
+          Option.isSome(preStartMonitors) && isFirstHumanSubmission(command, projection)
+            ? yield* preStartMonitors.value.holdDuration
+            : Option.none();
+        const preStart: OrchestrationV2RunPreStart | undefined =
+          Option.isSome(preStartHold) &&
+          (yield* projectionStore
+            .getMessageCount(command.threadId)
+            .pipe(mapDispatchError(command))) === 0
+            ? {
+                requestId: command.commandId,
+                expiresAt: DateTime.formatIso(DateTime.addDuration(now, preStartHold.value)),
+                status: "pending",
+                workspaceReady: dispatchMode.type !== "defer_start",
+              }
+            : undefined;
+        const deferStart = dispatchMode.type === "defer_start" || preStart !== undefined;
         const adapter = yield* providerAdapters.get(modelSelection.instanceId).pipe(
           Effect.mapError(
             (cause) =>
@@ -5368,31 +5455,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               };
         const attemptId = idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 });
         const rootNodeId = idAllocator.derive.rootNode({ runId });
-        const checkpointScope =
-          dispatchMode.type === "defer_start"
-            ? null
-            : yield* runtimePolicy
-                .resolve({
-                  thread: projection.thread,
-                  modelSelection,
-                })
-                .pipe(
-                  mapDispatchError(command),
-                  Effect.flatMap((resolvedRuntimePolicy) =>
-                    checkpointService.prepareRootRunScope({
-                      threadId: command.threadId,
-                      runId,
-                      rootNodeId,
-                      providerThreadId,
-                      cwd:
-                        resolvedRuntimePolicy.cwd ??
-                        projection.thread.worktreePath ??
-                        process.cwd(),
-                      createdAt: now,
-                    }),
-                  ),
-                  mapDispatchError(command),
-                );
+        const checkpointScope = deferStart
+          ? null
+          : yield* runtimePolicy
+              .resolve({
+                thread: projection.thread,
+                modelSelection,
+              })
+              .pipe(
+                mapDispatchError(command),
+                Effect.flatMap((resolvedRuntimePolicy) =>
+                  checkpointService.prepareRootRunScope({
+                    threadId: command.threadId,
+                    runId,
+                    rootNodeId,
+                    providerThreadId,
+                    cwd:
+                      resolvedRuntimePolicy.cwd ?? projection.thread.worktreePath ?? process.cwd(),
+                    createdAt: now,
+                  }),
+                ),
+                mapDispatchError(command),
+              );
         const run: OrchestrationV2Run = {
           id: runId,
           threadId: command.threadId,
@@ -5403,7 +5487,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           userMessageId: command.messageId,
           rootNodeId,
           activeAttemptId: attemptId,
-          status: dispatchMode.type === "defer_start" ? "preparing" : "starting",
+          status: deferStart ? "preparing" : "starting",
           queuePosition: null,
           requestedAt: now,
           startedAt: null,
@@ -5419,6 +5503,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             : {}),
           ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
           ...wakeWorkStartedAt(projection.runs, command),
+          ...(preStart === undefined ? {} : { preStart }),
         };
         const attempt: OrchestrationV2RunAttempt = {
           id: attemptId,
@@ -5503,30 +5588,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(command.context ? { context: command.context } : {}),
           attachments: command.attachments,
         };
-        const preparationTurnItem: OrchestrationV2TurnItem | null =
-          dispatchMode.type === "defer_start"
-            ? {
-                id: idAllocator.derive.turnItemFromProviderItem({
-                  driver: adapter.driver,
-                  nativeItemId: `workspace-preparation:${runId}`,
-                }),
-                threadId: command.threadId,
-                runId,
-                nodeId: rootNodeId,
-                providerThreadId,
-                providerTurnId: null,
-                nativeItemRef: null,
-                parentItemId: null,
-                ordinal: turnItem.ordinal + 1,
-                status: "running",
-                title: WORKSPACE_PREPARATION_INPUT,
-                startedAt: now,
-                completedAt: null,
-                updatedAt: now,
-                type: "command_execution",
-                input: WORKSPACE_PREPARATION_INPUT,
-              }
-            : null;
+        const preparationTurnItem: OrchestrationV2TurnItem | null = deferStart
+          ? {
+              id: idAllocator.derive.turnItemFromProviderItem({
+                driver: adapter.driver,
+                nativeItemId: `workspace-preparation:${runId}`,
+              }),
+              threadId: command.threadId,
+              runId,
+              nodeId: rootNodeId,
+              providerThreadId,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: turnItem.ordinal + 1,
+              status: "running",
+              title: WORKSPACE_PREPARATION_INPUT,
+              startedAt: now,
+              completedAt: null,
+              updatedAt: now,
+              type: "command_execution",
+              input: WORKSPACE_PREPARATION_INPUT,
+            }
+          : null;
         const emitEvent = emit(events, command);
         yield* emitEvent({
           type: "provider-thread.updated",
@@ -5620,8 +5704,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           threadId: command.threadId,
           request: { type: "provider-turn.start", runId },
         } satisfies PendingOrchestrationEffectV2;
-        if (dispatchMode.type !== "defer_start") {
+        if (!deferStart) {
           yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
+        }
+        if (preStart !== undefined) {
+          yield* Ref.update(effects, (existing) => [
+            ...existing,
+            {
+              id: `effect:${command.commandId}:run.pre-start.expire:${runId}`,
+              commandId: command.commandId,
+              threadId: command.threadId,
+              request: { type: "run.pre-start.expire", runId, requestId: preStart.requestId },
+              availableAt: DateTime.makeUnsafe(preStart.expiresAt),
+            } satisfies PendingOrchestrationEffectV2,
+          ]);
         }
         return;
       }
@@ -8000,7 +8096,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     });
 
   const loadProjectionForCommand = <K extends ProjectionRecordField>(
-    command: OrchestrationV2Command,
+    command: OrchestrationV2ServerCommand,
     fields: ReadonlyArray<K>,
     filter?: ProjectionRecordFilter,
   ) =>
@@ -8014,13 +8110,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   const preparedRunState = (
     command: Extract<
-      OrchestrationV2Command,
+      OrchestrationV2ServerCommand,
       {
         readonly type:
           | "prepared-run.release"
           | "prepared-run.progress"
           | "prepared-run.fail"
-          | "prepared-run.retry";
+          | "prepared-run.retry"
+          | "run.pre-start.settle";
       }
     >,
     projection: Pick<
@@ -8091,25 +8188,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     });
 
-  const dispatchPreparedRunRelease = (
-    command: Extract<OrchestrationV2Command, { readonly type: "prepared-run.release" }>,
+  /** Starts a prepared run's provider turn, in the commit of the command that ended its wait. */
+  const startPreparedRun = (
+    command: Extract<
+      OrchestrationV2ServerCommand,
+      { readonly type: "prepared-run.release" | "run.pre-start.settle" }
+    >,
+    projection: Pick<OrchestrationV2ThreadProjection, "thread">,
+    state: NonNullable<ReturnType<typeof preparedRunState>>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) =>
     Effect.gen(function* () {
-      const projection = yield* loadProjectionForCommand(
-        command,
-        ["runs", "attempts", "nodes", "providerThreads", "turnItems"],
-        { turnItemTypes: ["command_execution"], turnItemRunId: command.runId },
-      );
-      const state = preparedRunState(command, projection);
-      if (state === null) {
-        return yield* new OrchestratorDispatchError({
-          commandId: command.commandId,
-          commandType: command.type,
-          cause: `Run ${command.runId} is not awaiting workspace preparation.`,
-        });
-      }
       const now = yield* DateTime.now;
       const resolvedRuntimePolicy = yield* runtimePolicy
         .resolve({ thread: projection.thread, modelSelection: state.run.modelSelection })
@@ -8178,6 +8268,128 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           request: { type: "provider-turn.start", runId: state.run.id },
         } satisfies PendingOrchestrationEffectV2,
       ]);
+    });
+
+  const dispatchPreparedRunRelease = (
+    command: Extract<OrchestrationV2Command, { readonly type: "prepared-run.release" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ) =>
+    Effect.gen(function* () {
+      const projection = yield* loadProjectionForCommand(
+        command,
+        ["runs", "attempts", "nodes", "providerThreads", "turnItems"],
+        { turnItemTypes: ["command_execution"], turnItemRunId: command.runId },
+      );
+      const state = preparedRunState(command, projection);
+      if (state === null) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Run ${command.runId} is not awaiting workspace preparation.`,
+        });
+      }
+      // a run still held for pre-start monitors starts when its wait ends, not here
+      if (state.run.preStart?.status === "pending") {
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "run.updated",
+          threadId: command.threadId,
+          runId: state.run.id,
+          nodeId: state.rootNode.id,
+          providerInstanceId: state.run.providerInstanceId,
+          occurredAt: yield* DateTime.now,
+          payload: { ...state.run, preStart: { ...state.run.preStart, workspaceReady: true } },
+        });
+        return;
+      }
+      yield* startPreparedRun(command, projection, state, events, effects);
+    });
+
+  const dispatchRunPreStartSettle = (
+    command: Extract<OrchestrationV2InternalCommand, { readonly type: "run.pre-start.settle" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ) =>
+    Effect.gen(function* () {
+      const projection = yield* loadProjectionForCommand(
+        command,
+        ["runs", "attempts", "nodes", "providerThreads", "turnItems"],
+        { turnItemTypes: ["command_execution"], turnItemRunId: command.runId },
+      );
+      const run = projection.runs.find((candidate) => candidate.id === command.runId);
+      const preStart = run?.preStart;
+      const response = command.response;
+      if (
+        run === undefined ||
+        preStart?.status !== "pending" ||
+        preStart.requestId !== command.requestId ||
+        // a failed preparation keeps its wait, so a retry still respects it; archive
+        // cancels a preparing one, so only a failed run's expiry settles on an archived thread
+        (run.status !== "preparing" && run.status !== "failed") ||
+        projection.thread.deletedAt !== null ||
+        (response !== undefined &&
+          (projection.thread.archivedAt !== null ||
+            Option.isNone(preStartMonitors) ||
+            !(yield* preStartMonitors.value.isSubscribed(response))))
+      ) {
+        return yield* new OrchestratorCommandRejectedError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Run ${command.runId} is not waiting for pre-start monitors.`,
+        });
+      }
+      const now = yield* DateTime.now;
+      // a response after the deadline releases the run without its context
+      const answered =
+        response !== undefined && DateTime.isLessThan(now, DateTime.makeUnsafe(preStart.expiresAt));
+      const settled: OrchestrationV2RunPreStart = {
+        ...preStart,
+        status: answered ? "released" : "expired",
+        ...(answered && response.context !== undefined ? { context: response.context } : {}),
+      };
+      const settledRun: OrchestrationV2Run = { ...run, preStart: settled };
+      if (run.status === "preparing" && settled.workspaceReady) {
+        const state = preparedRunState(command, projection);
+        if (state === null) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: `Run ${command.runId} is not awaiting workspace preparation.`,
+          });
+        }
+        yield* startPreparedRun(
+          command,
+          projection,
+          { ...state, run: settledRun },
+          events,
+          effects,
+        );
+      } else {
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "run.updated",
+          threadId: command.threadId,
+          runId: run.id,
+          providerInstanceId: run.providerInstanceId,
+          occurredAt: now,
+          payload: settledRun,
+        });
+      }
+      // an answer leaves the expiry pending, where it would hold the thread's later effects
+      return response === undefined
+        ? undefined
+        : ({
+            effectTypes: ["run.pre-start.expire"],
+            reason: `Run ${run.id} was answered by a pre-start monitor.`,
+          } satisfies {
+            readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
+            readonly reason: string;
+          });
     });
 
   const dispatchPreparedRunFail = (
@@ -8358,7 +8570,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       yield* emitEvent({
         ...scope,
         type: "run.updated",
-        payload: { ...state.run, status: "preparing", completedAt: null },
+        payload: {
+          ...state.run,
+          status: "preparing",
+          completedAt: null,
+          // the retried preparation reports its own workspace, so a pre-start wait waits for it
+          ...(state.run.preStart === undefined
+            ? {}
+            : { preStart: { ...state.run.preStart, workspaceReady: false } }),
+        },
       });
       // Messages held when this preparation failed follow the run again. A hold
       // from a later run (a stop, say) is not this failure's to release.
@@ -9442,7 +9662,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         yield* stopRemainingWork();
         yield* Ref.update(effects, (existing) => [...existing, ...otherProviderInterrupts]);
         return {
-          effectTypes: ["provider-turn.start", "provider-turn.restart"],
+          effectTypes: ["provider-turn.start", "provider-turn.restart", "run.pre-start.expire"],
           reason: `Run ${run.id} was interrupted before its provider turn started.`,
         } satisfies {
           readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
@@ -10849,6 +11069,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "prepared-run.retry":
         yield* dispatchPreparedRunRetry(command, events);
+        break;
+      case "run.pre-start.settle":
+        cancelUnsettledEffects = yield* dispatchRunPreStartSettle(command, events, effects);
         break;
       case "runtime-request.respond":
         yield* dispatchRuntimeRequestRespond(command, events, effects);

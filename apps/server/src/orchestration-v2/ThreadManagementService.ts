@@ -8,6 +8,7 @@ import type {
   ProjectionRecords,
 } from "./ProjectionStore.ts";
 import {
+  type AuthSessionId,
   type ChatAttachment,
   CommandId,
   MessageId,
@@ -17,6 +18,8 @@ import {
   type OrchestrationV2Actor,
   type OrchestrationV2Command,
   type OrchestrationV2GetTurnItemResult,
+  type OrchestrationV2RespondPreStartInput,
+  type OrchestrationV2RespondPreStartResult,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2CreationSource,
@@ -33,6 +36,7 @@ import {
   ThreadId,
   type TurnItemId,
 } from "@t3tools/contracts";
+import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -317,6 +321,16 @@ export interface ThreadManagementServiceShape {
     command: OrchestrationV2ServerCommand,
   ) => Effect.Effect<
     Orchestrator.OrchestratorV2DispatchResult,
+    Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
+  >;
+  /**
+   * A subscribed pre-start monitor's answer to a held first run. Not accepted once that
+   * run's wait has ended, or when `subscriptionId` is not the session's open subscription.
+   */
+  readonly respondPreStart: (
+    input: OrchestrationV2RespondPreStartInput & { readonly sessionId: AuthSessionId },
+  ) => Effect.Effect<
+    OrchestrationV2RespondPreStartResult,
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
   >;
   readonly getThreadHistoryPage: Orchestrator.OrchestratorV2["Service"]["getThreadHistoryPage"];
@@ -655,6 +669,35 @@ const make = Effect.gen(function* () {
     ensureCommandTranscripts(command).pipe(
       Effect.andThen(assertDispatchTargetEnabled(command)),
       Effect.andThen(orchestrator.dispatch(command)),
+    );
+
+  const respondPreStart: ThreadManagementServiceShape["respondPreStart"] = (input) =>
+    randomUuidV4.pipe(
+      // the run's pending wait decides which answer counts, so each answer is its own command
+      Effect.flatMap((id) =>
+        dispatch({
+          type: "run.pre-start.settle",
+          commandId: CommandId.make(`pre-start:${input.requestId}:${id}`),
+          threadId: input.threadId,
+          runId: input.runId,
+          requestId: input.requestId,
+          response: {
+            sessionId: input.sessionId,
+            subscriptionId: input.subscriptionId,
+            ...(input.context === undefined ? {} : { context: input.context }),
+          },
+        }),
+      ),
+      // an answer after the deadline only expires the wait, without its context
+      Effect.map((result) => ({
+        accepted: result.storedEvents.some(
+          ({ event }) =>
+            event.type === "run.updated" && event.payload.preStart?.status === "released",
+        ),
+      })),
+      Effect.catchTags({
+        OrchestratorCommandRejectedError: () => Effect.succeed({ accepted: false }),
+      }),
     );
 
   const getProjectThread: ThreadManagementServiceShape["getProjectThread"] = (input) =>
@@ -1110,6 +1153,7 @@ const make = Effect.gen(function* () {
         Effect.andThen(orchestrator.searchThread(input)),
       ),
     dispatch,
+    respondPreStart,
     getThreadHistoryPage: (threadId, cursor, throughEntryId, conversationOnly) =>
       ensureProjectionTranscript(threadId).pipe(
         Effect.andThen(

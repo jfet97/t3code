@@ -60,6 +60,7 @@ import {
   OrchestrationV2DispatchCommandError,
   OrchestrationV2GetShellSnapshotError,
   OrchestrationV2GetThreadProjectionError,
+  OrchestrationV2PreStartError,
   OrchestrationV2ThreadLaunchError,
   type OrchestrationProjectShell,
   type OrchestrationV2ShellSnapshot,
@@ -121,6 +122,7 @@ import * as McpAppRequests from "./mcpApps/McpAppRequests.ts";
 import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
+import * as PreStartMonitors from "./orchestration-v2/PreStartMonitors.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
@@ -1248,6 +1250,7 @@ const layerWsRpc = (
       const deviceHostContext =
         yield* Effect.context<Effect.Services<ReturnType<typeof remoteSshDeviceHosts>>>();
       const orchestrationEngine = yield* Orchestrator.OrchestratorV2;
+      const preStartMonitors = yield* PreStartMonitors.PreStartMonitors;
       const crypto = yield* Crypto.Crypto;
       const serverCommandId = (tag: string) =>
         crypto.randomUUIDv4.pipe(
@@ -2066,6 +2069,14 @@ const layerWsRpc = (
               Effect.andThen(subscribeOrchestrationV2Thread(input)),
             ),
           ),
+        [ORCHESTRATION_V2_WS_METHODS.subscribePreStart]: (input) =>
+          preStartMonitors
+            .subscribe({ ...input, sessionId: currentSessionId })
+            .pipe(Stream.mapError((cause) => new OrchestrationV2PreStartError({ cause }))),
+        [ORCHESTRATION_V2_WS_METHODS.respondPreStart]: (input) =>
+          threadManagement
+            .respondPreStart({ ...input, sessionId: currentSessionId })
+            .pipe(Effect.mapError((cause) => new OrchestrationV2PreStartError({ cause }))),
         [WS_METHODS.scheduledTasksList]: (_input) =>
           scheduledTasks.list().pipe(Effect.map(withVisibleWebhookUrls)),
         [WS_METHODS.scheduledTasksSubscribe]: (_input) =>

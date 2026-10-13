@@ -542,6 +542,32 @@ export const layerExecutor: Layer.Layer<
                     }),
                 ),
               );
+          case "run.pre-start.expire":
+            return threads
+              .dispatch({
+                type: "run.pre-start.settle",
+                // a failed attempt records a rejected receipt, so each attempt needs its own command
+                commandId: CommandId.make(`${effect.id}:settle:${effect.attemptCount}`),
+                threadId: effect.threadId,
+                runId: effect.request.runId,
+                requestId: effect.request.requestId,
+              })
+              .pipe(
+                Effect.asVoid,
+                // a response, Stop or archive already ended the wait
+                Effect.catchTags({
+                  OrchestratorCommandRejectedError: () => Effect.void,
+                  OrchestratorCommandPreviouslyRejectedError: () => Effect.void,
+                }),
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
         }
       },
     });
@@ -775,7 +801,9 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : effect.attemptCount >= maxAttempts
+            : effect.attemptCount >= maxAttempts &&
+                // an expiry is all that releases a held first run, so it retries until it lands
+                effect.request.type !== "run.pre-start.expire"
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
