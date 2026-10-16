@@ -524,14 +524,19 @@ export const OrchestrationV2PreStartContext = TrimmedNonEmptyString.check(
 );
 
 /**
- * A new thread's first message held for pre-start monitors (see `subscribePreStart`).
- * The run stays `preparing` until a monitor responds or `expiresAt` passes; only
- * then does its first provider turn start.
+ * A new thread's first message held for its project's pre-start monitors (see
+ * `subscribePreStart`). The run stays `preparing` until the wait ends and its workspace is
+ * ready; only then does its first provider turn start.
  */
 export const OrchestrationV2RunPreStart = Schema.Struct({
   /** The first message's command. A response or the expiry must name it to end this wait. */
   requestId: CommandId,
+  /** When monitors stop being able to answer; the run starts once its workspace is also ready. */
   expiresAt: IsoDateTime,
+  /**
+   * `released`: a monitor answered in time. `expired`: the wait ended without an answer, at
+   * the deadline, when the user continued without the monitor, or when preparation failed.
+   */
   status: Schema.Literals(["pending", "released", "expired"]),
   /** False while a launch still prepares the run's workspace. */
   workspaceReady: Schema.Boolean,
@@ -3080,6 +3085,13 @@ const OrchestrationV2InternalCommand = Schema.Union([
       }),
     ),
   }),
+  /** Ends a still-pending pre-start wait without monitor context; the run then starts as usual. */
+  Schema.Struct({
+    type: Schema.Literal("run.pre-start.continue"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+  }),
 ]);
 export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalCommand.Type;
 
@@ -3103,6 +3115,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   subscribeThread: "orchestration.subscribeThread",
   subscribePreStart: "orchestration.subscribePreStart",
   respondPreStart: "orchestration.respondPreStart",
+  continuePreStart: "orchestration.continuePreStart",
   subscribeCommandOutput: "orchestration.subscribeCommandOutput",
 } as const;
 
@@ -3225,12 +3238,14 @@ export const OrchestrationV2SubscribeThreadInput = Schema.Struct({
 export type OrchestrationV2SubscribeThreadInput = typeof OrchestrationV2SubscribeThreadInput.Type;
 
 /**
- * Subscribing makes the connection a pre-start monitor. While any monitor is subscribed, a
- * new thread's first message waits in `preparing` for up to `holdMs` before its provider
- * turn starts, so a monitor can add context with `respondPreStart`.
+ * Subscribing makes the connection a pre-start monitor for one project. While any monitor of
+ * that project is subscribed, a new thread's first message there waits in `preparing` for up
+ * to `holdMs` before its provider turn starts, so a monitor can add context with
+ * `respondPreStart`. Other projects are not held.
  */
 export const OrchestrationV2SubscribePreStartInput = Schema.Struct({
-  /** Milliseconds a held run waits for this monitor: 120000 when omitted, and never more. */
+  projectId: ProjectId,
+  /** Milliseconds a held run waits for this monitor: 10000 when omitted, at most 120000. */
   holdMs: Schema.optionalKey(PositiveInt),
 });
 export type OrchestrationV2SubscribePreStartInput =
@@ -3244,6 +3259,7 @@ export const OrchestrationV2PreStartStreamItem = Schema.Union([
   }),
   Schema.Struct({
     kind: Schema.Literal("held"),
+    projectId: ProjectId,
     threadId: ThreadId,
     runId: RunId,
     messageId: MessageId,
@@ -3268,6 +3284,20 @@ export const OrchestrationV2RespondPreStartResult = Schema.Struct({
   accepted: Schema.Boolean,
 });
 export type OrchestrationV2RespondPreStartResult = typeof OrchestrationV2RespondPreStartResult.Type;
+
+/** Lets the user start a held first message without waiting for its monitors. */
+export const OrchestrationV2ContinuePreStartInput = Schema.Struct({
+  threadId: ThreadId,
+  runId: RunId,
+});
+export type OrchestrationV2ContinuePreStartInput = typeof OrchestrationV2ContinuePreStartInput.Type;
+
+export const OrchestrationV2ContinuePreStartResult = Schema.Struct({
+  /** False when the wait had already ended, for example because a monitor answered first. */
+  continued: Schema.Boolean,
+});
+export type OrchestrationV2ContinuePreStartResult =
+  typeof OrchestrationV2ContinuePreStartResult.Type;
 
 export const OrchestrationV2ThreadDetailSnapshot = Schema.Struct({
   snapshotSequence: NonNegativeInt,
@@ -3679,6 +3709,10 @@ export const OrchestrationV2RpcSchemas = {
   respondPreStart: {
     input: OrchestrationV2RespondPreStartInput,
     output: OrchestrationV2RespondPreStartResult,
+  },
+  continuePreStart: {
+    input: OrchestrationV2ContinuePreStartInput,
+    output: OrchestrationV2ContinuePreStartResult,
   },
   subscribeCommandOutput: {
     input: OrchestrationV2SubscribeCommandOutputInput,

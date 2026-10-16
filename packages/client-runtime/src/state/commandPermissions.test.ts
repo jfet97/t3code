@@ -10,6 +10,8 @@ import {
   AuthOrchestrationOperateScope,
   AuthSettingsWriteScope,
   AuthSourceControlWriteScope,
+  ORCHESTRATION_V2_WS_METHODS,
+  RunId,
   ThreadId,
   EnvironmentId,
   ScheduledTaskId,
@@ -17,6 +19,7 @@ import {
   type AuthSessionState,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -25,6 +28,7 @@ import { Atom, AtomRegistry, AsyncResult } from "effect/reactivity";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { createCommandPermissions } from "./commandPermissions.ts";
 import { createEnvironmentRpcCommand } from "./runtime.ts";
+import { createThreadEnvironmentAtoms } from "./threadCommands.ts";
 
 vi.mock("./session.ts", () => ({
   createEnvironmentSessionAtoms: () => ({ sessionStateAtom: sessions }),
@@ -308,4 +312,68 @@ it.effect("rejects protected unary and streamed RPCs outside a guarded command",
     expect(streamed._tag).toBe("EnvironmentAuthorizationError");
     expect(writes).toBe(0);
   }),
+);
+
+it.effect("continues a held run only on a destination that grants operate", () =>
+  Effect.gen(function* () {
+    const continued: EnvironmentId[] = [];
+    const supervisors = new Map<EnvironmentId, EnvironmentSupervisor["Service"]>();
+    for (const environmentId of [env, other]) {
+      const session = {
+        client: {
+          [ORCHESTRATION_V2_WS_METHODS.continuePreStart]: () =>
+            Effect.sync(() => {
+              continued.push(environmentId);
+              return { continued: true };
+            }),
+        },
+      } as unknown as RpcSession;
+      supervisors.set(environmentId, {
+        target: { environmentId, label: environmentId },
+        session: yield* SubscriptionRef.make(Option.some(session)),
+      } as unknown as EnvironmentSupervisor["Service"]);
+    }
+    const threads = createThreadEnvironmentAtoms(
+      Atom.runtime(
+        Layer.mergeAll(
+          Layer.succeed(EnvironmentRegistry, {
+            run: (environmentId, effect) =>
+              Effect.provideService(effect, EnvironmentSupervisor, supervisors.get(environmentId)!),
+          } as EnvironmentRegistry["Service"]),
+          Layer.succeed(
+            Crypto.Crypto,
+            Crypto.make({
+              randomBytes: (size) => new Uint8Array(size),
+              digest: (_algorithm, data) => Effect.succeed(data),
+            }),
+          ),
+        ),
+      ),
+      () => Atom.make(null),
+    );
+    const command = threads.continueWithoutPreStartMonitor;
+    const input = { threadId: ThreadId.make("thread"), runId: RunId.make("run") };
+    const registry = yield* setup;
+    registry.mount(sessions(other));
+    registry.set(sessions(env), AsyncResult.success(grant(false)));
+    registry.set(sessions(other), AsyncResult.success(grant(true)));
+    expect(registry.get(command.permissionAtom(env))).toBe(false);
+    expect(registry.get(command.permissionAtom(other))).toBe(true);
+    const denied = yield* Effect.promise(() =>
+      command.run(registry, { environmentId: env, input }),
+    );
+    expect(denied._tag === "Failure" && Cause.squash(denied.cause)).toMatchObject({
+      _tag: "EnvironmentAuthorizationError",
+      requiredScope: AuthOrchestrationOperateScope,
+    });
+    expect(continued).toEqual([]);
+
+    registry.set(sessions(env), AsyncResult.success(grant(true)));
+    expect(registry.get(command.permissionAtom(env))).toBe(true);
+    const allowed = yield* Effect.promise(() =>
+      command.run(registry, { environmentId: env, input }),
+    );
+    expect(allowed._tag).toBe("Success");
+    expect(continued).toEqual([env]);
+  }).pipe(Effect.scoped),
 );

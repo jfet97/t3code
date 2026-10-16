@@ -53,6 +53,7 @@ import type { FollowUpBehavior } from "../../lib/followUpBehavior";
 import type { ActiveTurnComposerAction } from "@t3tools/client-runtime/state/composer-dispatch";
 import * as Haptics from "expo-haptics";
 import {
+  type ComponentProps,
   memo,
   useCallback,
   useContext,
@@ -147,6 +148,7 @@ import {
 import { ComposerPopoverHost } from "./ComposerPopoverHost";
 import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
 import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
+import { ComposerPreStartWaitBanner } from "./ComposerPreStartWaitBanner";
 import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
 import { useThreadQueuedCount } from "./ThreadQueueControl";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
@@ -184,6 +186,7 @@ export interface ThreadDetailScreenProps {
       }
     | { readonly kind: "failed"; readonly reason: string; readonly onEditTask: () => void }
     | null;
+  readonly preStartWait?: ComponentProps<typeof ComposerPreStartWaitBanner> | null;
   readonly activePendingApproval: PendingApproval | null;
   readonly respondingApprovalId: RuntimeRequestId | null;
   readonly activePendingUserInput: PendingUserInput | null;
@@ -1186,6 +1189,15 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                   }}
                 />
                 <View className="w-full self-center" style={{ maxWidth: contentMaxWidth }}>
+                  {props.preStartWait ? (
+                    <Animated.View
+                      className="shrink-0"
+                      entering={FadeInDown.duration(180)}
+                      exiting={FadeOut.duration(120)}
+                    >
+                      <ComposerPreStartWaitBanner {...props.preStartWait} />
+                    </Animated.View>
+                  ) : null}
                   {props.queuedRunEdit !== null ? (
                     <Animated.View
                       className="shrink-0"

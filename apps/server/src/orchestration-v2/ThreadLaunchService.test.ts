@@ -11,27 +11,38 @@ import { assert, it, vi } from "@effect/vitest";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
   AuthSessionId,
+  type AuthEnvironmentScope,
   ChatAttachmentId,
   ComposerContextId,
   type ChatAttachment,
   CommandId,
+  EnvironmentHttpApi,
   EnvironmentId,
   DEFAULT_SERVER_SETTINGS,
   GitCommandError,
   MessageId,
+  ORCHESTRATION_PROTOCOL_QUERY_PARAM,
+  ORCHESTRATION_PROTOCOL_VERSION,
+  ORCHESTRATION_V2_WS_METHODS,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
+  ProviderTurnId,
   OrchestrationV2ThreadProjectionJson,
   type OrchestrationV2PreStartStreamItem,
   type OrchestrationV2Run,
-  type RunId,
+  RunId,
   ScheduledTaskId,
   type ServerProvider,
   ThreadId,
+  WsRpcGroup,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -40,13 +51,39 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Redacted from "effect/Redacted";
 import * as Ref from "effect/Ref";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
+import {
+  FetchHttpClient,
+  HttpClient,
+  HttpRouter,
+  HttpServer,
+  HttpServerRequest,
+  HttpServerResponse,
+} from "effect/http";
+import * as Etag from "effect/http/Etag";
+import * as HttpPlatform from "effect/http/HttpPlatform";
+import * as HttpApi from "effect/http-api/HttpApi";
+import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
+import { RpcGroup, RpcServer, RpcSerialization } from "effect/rpc";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 
+import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+import * as AuthHttp from "../auth/http.ts";
+import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "../auth/http.ts";
+import * as RpcAuthorization from "../auth/RpcAuthorization.ts";
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
+import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
+import * as ProjectEnrichment from "../project/ProjectEnrichmentService.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -71,6 +108,19 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as ThreadTitleRegeneration from "./ThreadTitleRegenerationService.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
+import {
+  continueOrchestrationV2PreStart,
+  hasCompatibleOrchestrationProtocol,
+  respondOrchestrationV2PreStart,
+  subscribeOrchestrationV2PreStart,
+  subscribeOrchestrationV2Shell,
+  WS_RPC_SERVER_OPTIONS,
+} from "../ws.ts";
+import {
+  connectMonitorClient,
+  runBriefingMonitor,
+  type PreStartMonitorClient,
+} from "../../scripts/pre-start-briefing-monitor.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const projectId = ProjectId.make("project:launch-test");
@@ -275,11 +325,12 @@ function launchInput(input: {
   readonly thread: string;
   readonly message?: string;
   readonly workspace?: ThreadLaunch.ThreadLaunchWorkspaceStrategy;
+  readonly project?: ProjectId;
 }) {
   return {
     commandId: CommandId.make(input.command),
     threadId: ThreadId.make(input.thread),
-    projectId,
+    projectId: input.project ?? projectId,
     title: "New thread",
     modelSelection,
     runtimeMode: "full-access" as const,
@@ -2836,11 +2887,11 @@ it.effect("replays an accepted message.dispatch after the project disables the i
 const monitorSessionId = AuthSessionId.make("session:pre-start-monitor");
 
 /** Subscribes as a pre-start monitor; runs are held for it once this returns. */
-const subscribePreStartFor = (holdMs?: number) =>
+const subscribePreStartFor = (holdMs?: number, project: ProjectId = projectId) =>
   Effect.gen(function* () {
     const monitors = yield* PreStartMonitors.PreStartMonitors;
     const items = yield* Queue.unbounded<OrchestrationV2PreStartStreamItem>();
-    yield* monitors.subscribe({ sessionId: monitorSessionId, holdMs }).pipe(
+    yield* monitors.subscribe({ sessionId: monitorSessionId, projectId: project, holdMs }).pipe(
       Stream.runForEach((item) => Queue.offer(items, item)),
       Effect.forkScoped,
     );
@@ -2992,8 +3043,8 @@ it.effect("releases a held first message unchanged when no monitor answers in ti
     );
     assert.isEmpty(yield* outbox.listByCommandId(release));
 
-    // a monitor that names no budget holds the run for two minutes
-    yield* TestClock.adjust(Duration.millis(119_999));
+    // a monitor that names no budget holds the run for ten seconds
+    yield* TestClock.adjust(Duration.millis(9_999));
     assert.isFalse(yield* worker.runOnce);
     yield* TestClock.adjust(Duration.millis(1));
     assert.isTrue(yield* worker.runOnce);
@@ -3136,7 +3187,7 @@ it.effect("accepts a pre-start answer only from its open subscription before the
     );
 
     // from the deadline on, an answer releases the run without its context
-    yield* TestClock.adjust(Duration.minutes(2));
+    yield* TestClock.adjust(Duration.seconds(10));
     assert.isFalse((yield* threads.respondPreStart(answer)).accepted);
     const run = (yield* threads.getThreadProjection(created.threadId)).runs[0];
     assert.equal(run?.status, "starting");
@@ -3204,40 +3255,147 @@ it.effect("does not start an archived thread after a monitor answered its first 
   }),
 );
 
-it.effect("prepares a held first run again when its failed preparation is retried", () => {
+/** The expiry effect statuses of a held first message's dispatch. */
+const expiryStatuses = (requestId: CommandId) =>
+  EffectOutbox.EffectOutboxV2.pipe(
+    Effect.flatMap((outbox) => outbox.listByCommandId(requestId)),
+    Effect.map((effects) =>
+      effects
+        .filter((effect) => effect.request.type === "run.pre-start.expire")
+        .map((effect) => effect.status),
+    ),
+  );
+
+it.effect("holds only first messages in a monitor's project and takes answers only for it", () => {
   const harness = makeHarness();
   return Effect.gen(function* () {
     const launches = yield* ThreadLaunch.ThreadLaunchService;
     const threads = yield* ThreadManagement.ThreadManagementService;
     const monitor = yield* subscribePreStart;
-    const input = launchInput({
-      command: "launch:pre-start-retry",
-      thread: "thread:pre-start-retry",
-      message: "Fix the login bug",
-    });
-    const launched = yield* launches.launch(input);
-    const held = yield* monitor.held;
-    const preStartOf = threads
-      .getThreadProjection(launched.threadId)
-      .pipe(Effect.map((projection) => projection.runs[0]?.preStart));
-    yield* waitUntil(() =>
-      preStartOf.pipe(Effect.map((preStart) => preStart?.workspaceReady === true)),
-    );
 
-    yield* threads.dispatch({
-      type: "prepared-run.fail",
-      commandId: CommandId.make("command:pre-start-retry:fail"),
-      threadId: launched.threadId,
+    const unrelated = yield* launches.launch(
+      launchInput({
+        command: "launch:pre-start-unrelated",
+        thread: "thread:pre-start-unrelated",
+        message: "Fix the login bug",
+        project: otherProjectId,
+      }),
+    );
+    assert.isUndefined((yield* threads.getThreadProjection(unrelated.threadId)).runs[0]?.preStart);
+
+    const otherMonitor = yield* subscribePreStartFor(undefined, otherProjectId);
+    const created = yield* launches.launch(
+      launchInput({ command: "launch:pre-start-scoped", thread: "thread:pre-start-scoped" }),
+    );
+    yield* threads.dispatch(firstMessage(created.threadId, "command:pre-start-scoped"));
+    const held = yield* monitor.held;
+    assert.equal(held.projectId, projectId);
+    const answer = {
+      sessionId: monitorSessionId,
+      subscriptionId: otherMonitor.subscriptionId,
+      threadId: held.threadId,
       runId: held.runId,
-      failure: makeProviderFailure({ message: "Setup failed.", class: "validation_error" }),
+      requestId: held.requestId,
+      context: "Propose a plan before editing files.",
+    };
+    assert.isFalse((yield* threads.respondPreStart(answer)).accepted);
+
+    // the other project's monitor hears only about its own project
+    const otherThread = yield* launches.launch(
+      launchInput({
+        command: "launch:pre-start-other",
+        thread: "thread:pre-start-other",
+        message: "Fix the signup bug",
+        project: otherProjectId,
+      }),
+    );
+    const otherHeld = yield* otherMonitor.held;
+    assert.equal(otherHeld.projectId, otherProjectId);
+    assert.equal(otherHeld.threadId, otherThread.threadId);
+
+    assert.isTrue(
+      (yield* threads.respondPreStart({ ...answer, subscriptionId: monitor.subscriptionId }))
+        .accepted,
+    );
+    assert.equal(
+      (yield* threads.getThreadProjection(created.threadId)).runs[0]?.preStart?.context,
+      "Propose a plan before editing files.",
+    );
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("continues a held first message without its monitor once its workspace is ready", () =>
+  Effect.gen(function* () {
+    const setupEntered = yield* Deferred.make<void>();
+    const allowSetup = yield* Deferred.make<void>();
+    const harness = makeHarness({
+      runSetup: () =>
+        Deferred.succeed(setupEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(allowSetup)),
+          Effect.as({ status: "no-script" as const }),
+        ),
     });
-    // an archived thread takes no monitor context, even for a failed run
-    yield* threads.dispatch({
-      type: "thread.archive",
-      commandId: CommandId.make("command:pre-start-retry:archive"),
-      threadId: launched.threadId,
-    });
-    assert.isFalse(
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const monitor = yield* subscribePreStart;
+      const launched = yield* launches.launch(
+        launchInput({
+          command: "launch:pre-start-continue",
+          thread: "thread:pre-start-continue",
+          message: "Fix the login bug",
+        }),
+      );
+      const held = yield* monitor.held;
+      yield* Deferred.await(setupEntered);
+      const before = (yield* threads.getThreadProjection(launched.threadId)).runs[0];
+
+      assert.isTrue(
+        (yield* threads.continuePreStart({ threadId: launched.threadId, runId: held.runId }))
+          .continued,
+      );
+      // the wait is over, but the run still waits for its workspace
+      const waiting = (yield* threads.getThreadProjection(launched.threadId)).runs[0];
+      assert.equal(waiting?.status, "preparing");
+      assert.equal(waiting?.preStart?.status, "expired");
+      assert.deepEqual(yield* expiryStatuses(held.requestId), ["cancelled"]);
+      assert.isFalse(
+        (yield* threads.respondPreStart({
+          sessionId: monitorSessionId,
+          subscriptionId: monitor.subscriptionId,
+          threadId: held.threadId,
+          runId: held.runId,
+          requestId: held.requestId,
+          context: "Propose a plan before editing files.",
+        })).accepted,
+      );
+
+      yield* Deferred.succeed(allowSetup, undefined);
+      yield* awaitRun(launched.threadId, held.runId, (run) => run.status === "starting");
+      const projection = yield* threads.getThreadProjection(launched.threadId);
+      assert.lengthOf(projection.runs, 1);
+      const started = projection.runs[0];
+      assert.equal(started?.id, held.runId);
+      assert.equal(started?.userMessageId, held.messageId);
+      assert.equal(started?.rootNodeId, before?.rootNodeId);
+      assert.equal(started?.activeAttemptId, before?.activeAttemptId);
+      assert.isUndefined(started?.preStart?.context);
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect("keeps a monitor's answer when Continue arrives after it", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const created = yield* launches.launch(
+      launchInput({ command: "launch:pre-start-race", thread: "thread:pre-start-race" }),
+    );
+    const monitor = yield* subscribePreStart;
+    yield* threads.dispatch(firstMessage(created.threadId, "command:pre-start-race"));
+    const held = yield* monitor.held;
+    assert.isTrue(
       (yield* threads.respondPreStart({
         sessionId: monitorSessionId,
         subscriptionId: monitor.subscriptionId,
@@ -3247,144 +3405,650 @@ it.effect("prepares a held first run again when its failed preparation is retrie
         context: "Propose a plan before editing files.",
       })).accepted,
     );
-    yield* threads.dispatch({
-      type: "thread.unarchive",
-      commandId: CommandId.make("command:pre-start-retry:unarchive"),
-      threadId: launched.threadId,
-    });
 
-    // the retry prepares the workspace again instead of trusting the failed attempt's
-    yield* launches.retryPreparation({
-      commandId: CommandId.make("command:pre-start-retry:retry"),
-      threadId: launched.threadId,
-      runId: held.runId,
-    });
-    yield* waitUntil(() =>
-      preStartOf.pipe(Effect.map((preStart) => preStart?.workspaceReady === true)),
+    assert.isFalse(
+      (yield* threads.continuePreStart({ threadId: created.threadId, runId: held.runId }))
+        .continued,
     );
-    const preStart = yield* preStartOf;
-    assert.equal(preStart?.status, "pending");
-    assert.equal(harness.runSetup.mock.calls.length, 2);
+    const run = (yield* threads.getThreadProjection(created.threadId)).runs[0];
+    assert.equal(run?.status, "starting");
+    assert.equal(run?.preStart?.status, "released");
+    assert.equal(run?.preStart?.context, "Propose a plan before editing files.");
   }).pipe(Effect.provide(harness.layer));
 });
 
-/** Launches a held first run and fails its workspace preparation, leaving its wait pending. */
-const failHeldLaunch = (name: string) =>
+it.effect(
+  "ends a held first run's wait when its preparation fails, so a retry starts at once",
+  () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const monitor = yield* subscribePreStart;
+      const launched = yield* launches.launch(
+        launchInput({
+          command: "launch:pre-start-retry",
+          thread: "thread:pre-start-retry",
+          message: "Fix the login bug",
+        }),
+      );
+      const held = yield* monitor.held;
+      yield* awaitRun(
+        launched.threadId,
+        held.runId,
+        (run) => run.preStart?.workspaceReady === true,
+      );
+
+      yield* threads.dispatch({
+        type: "prepared-run.fail",
+        commandId: CommandId.make("command:pre-start-retry:fail"),
+        threadId: launched.threadId,
+        runId: held.runId,
+        failure: makeProviderFailure({ message: "Setup failed.", class: "validation_error" }),
+      });
+      const failed = (yield* threads.getThreadProjection(launched.threadId)).runs[0];
+      assert.equal(failed?.status, "failed");
+      assert.equal(failed?.preStart?.status, "expired");
+      assert.deepEqual(yield* expiryStatuses(held.requestId), ["cancelled"]);
+      assert.isFalse(
+        (yield* threads.respondPreStart({
+          sessionId: monitorSessionId,
+          subscriptionId: monitor.subscriptionId,
+          threadId: held.threadId,
+          runId: held.runId,
+          requestId: held.requestId,
+          context: "Propose a plan before editing files.",
+        })).accepted,
+      );
+
+      // the retry prepares the workspace again and does not reopen the wait
+      yield* launches.retryPreparation({
+        commandId: CommandId.make("command:pre-start-retry:retry"),
+        threadId: launched.threadId,
+        runId: held.runId,
+      });
+      yield* awaitRun(launched.threadId, held.runId, (run) => run.status === "starting");
+      assert.isUndefined(
+        (yield* threads.getThreadProjection(launched.threadId)).runs[0]?.preStart?.context,
+      );
+      assert.equal(harness.runSetup.mock.calls.length, 2);
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect("keeps a monitor's answer when the held run's preparation fails and is retried", () =>
   Effect.gen(function* () {
-    const launches = yield* ThreadLaunch.ThreadLaunchService;
-    const threads = yield* ThreadManagement.ThreadManagementService;
-    const monitor = yield* subscribePreStart;
-    const launched = yield* launches.launch(
-      launchInput({
-        command: `launch:${name}`,
-        thread: `thread:${name}`,
-        message: "Fix the login bug",
-      }),
-    );
-    const held = yield* monitor.held;
-    const runOf = threads
-      .getThreadProjection(launched.threadId)
-      .pipe(Effect.map((projection) => projection.runs.find((run) => run.id === held.runId)));
-    yield* awaitRun(launched.threadId, held.runId, (run) => run.preStart?.workspaceReady === true);
-    yield* threads.dispatch({
-      type: "prepared-run.fail",
-      commandId: CommandId.make(`command:${name}:fail`),
-      threadId: launched.threadId,
-      runId: held.runId,
-      failure: makeProviderFailure({ message: "Setup failed.", class: "validation_error" }),
+    const setupEntered = yield* Deferred.make<void>();
+    const failSetup = yield* Deferred.make<void>();
+    let setups = 0;
+    const harness = makeHarness({
+      runSetup: () => {
+        setups += 1;
+        return setups > 1
+          ? Effect.succeed({ status: "no-script" as const })
+          : Deferred.succeed(setupEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(failSetup)),
+              Effect.andThen(
+                Effect.fail(
+                  new ProjectSetupScriptRunner.ProjectSetupScriptOperationError({
+                    threadId: "thread:pre-start-kept",
+                    worktreePath: "/repo",
+                    operation: "writeCommand",
+                    cause: "setup failed",
+                  }),
+                ),
+              ),
+            );
+      },
     });
-    assert.equal((yield* runOf)?.status, "failed");
-    return { monitor, held, threadId: launched.threadId, runOf };
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const monitor = yield* subscribePreStart;
+      const launched = yield* launches.launch(
+        launchInput({
+          command: "launch:pre-start-kept",
+          thread: "thread:pre-start-kept",
+          message: "Fix the login bug",
+        }),
+      );
+      const held = yield* monitor.held;
+      yield* Deferred.await(setupEntered);
+      assert.isTrue(
+        (yield* threads.respondPreStart({
+          sessionId: monitorSessionId,
+          subscriptionId: monitor.subscriptionId,
+          threadId: held.threadId,
+          runId: held.runId,
+          requestId: held.requestId,
+          context: "Propose a plan before editing files.",
+        })).accepted,
+      );
+
+      yield* Deferred.succeed(failSetup, undefined);
+      yield* awaitRun(launched.threadId, held.runId, (run) => run.status === "failed");
+      yield* launches.retryPreparation({
+        commandId: CommandId.make("command:pre-start-kept:retry"),
+        threadId: launched.threadId,
+        runId: held.runId,
+      });
+      yield* awaitRun(launched.threadId, held.runId, (run) => run.status === "starting");
+      const run = (yield* threads.getThreadProjection(launched.threadId)).runs[0];
+      assert.equal(run?.preStart?.status, "released");
+      assert.equal(run?.preStart?.context, "Propose a plan before editing files.");
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+/** A scripted provider in place of a provider CLI; it records every turn it is asked to start. */
+function scriptedProvider() {
+  const started: ProviderAdapter.ProviderAdapterV2TurnInput[] = [];
+  const driver = ProviderDriverKind.make("codex");
+  const instanceId = modelSelection.instanceId;
+  const scripted: ProviderAdapter.ProviderAdapterV2["Service"] = {
+    instanceId,
+    driver,
+    getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
+    openSession: (input) =>
+      Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        return {
+          instanceId,
+          driver,
+          providerSessionId: input.providerSessionId,
+          providerSession: {
+            id: input.providerSessionId,
+            driver,
+            providerInstanceId: instanceId,
+            status: "ready",
+            cwd: project.workspaceRoot,
+            model: modelSelection.model,
+            capabilities: CodexProviderCapabilitiesV2,
+            createdAt: now,
+            updatedAt: now,
+            lastError: null,
+          },
+          events: Stream.fromQueue(events),
+          ensureThread: ({ threadId }) =>
+            Effect.succeed({
+              id: ProviderThreadId.make(`provider-thread:codex:${threadId}`),
+              driver,
+              providerInstanceId: instanceId,
+              providerSessionId: input.providerSessionId,
+              appThreadId: threadId,
+              ownerNodeId: null,
+              nativeThreadRef: { driver, nativeId: `native:${threadId}`, strength: "strong" },
+              nativeConversationHeadRef: null,
+              status: "idle",
+              firstRunOrdinal: null,
+              lastRunOrdinal: null,
+              handoffIds: [],
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+            }),
+          resumeThread: ({ providerThread }) => Effect.succeed(providerThread),
+          startTurn: (turn) =>
+            Effect.gen(function* () {
+              started.push(turn);
+              yield* Queue.offer(events, {
+                type: "provider_turn.updated",
+                driver,
+                providerTurn: {
+                  id: ProviderTurnId.make(`provider-turn:${turn.attemptId}`),
+                  providerThreadId: turn.providerThread.id,
+                  nodeId: turn.rootNodeId,
+                  runAttemptId: turn.attemptId,
+                  nativeTurnRef: {
+                    driver,
+                    nativeId: `native:${turn.attemptId}`,
+                    strength: "strong",
+                  },
+                  ordinal: turn.providerTurnOrdinal,
+                  status: "running",
+                  startedAt: now,
+                  completedAt: null,
+                },
+              });
+            }),
+          steerTurn: () => Effect.die("unused"),
+          interruptTurn: () => Effect.void,
+          respondToRuntimeRequest: () => Effect.die("unused"),
+          readThreadSnapshot: () => Effect.die("unused"),
+          rollbackThread: () => Effect.die("unused"),
+          forkThread: () => Effect.die("unused"),
+        };
+      }),
+  };
+  return { adapter: scripted, started };
+}
+
+// the pre-start RPCs exactly as the server declares them, scope middleware included
+const serverRpc = <const Tag extends RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"]>(tag: Tag) =>
+  WsRpcGroup.requests.get(tag) as Extract<RpcGroup.Rpcs<typeof WsRpcGroup>, { readonly _tag: Tag }>;
+const preStartRpcGroup = RpcGroup.make(
+  serverRpc(ORCHESTRATION_V2_WS_METHODS.subscribePreStart),
+  serverRpc(ORCHESTRATION_V2_WS_METHODS.respondPreStart),
+  serverRpc(ORCHESTRATION_V2_WS_METHODS.continuePreStart),
+  serverRpc(ORCHESTRATION_V2_WS_METHODS.subscribeShell),
+  serverRpc(ORCHESTRATION_V2_WS_METHODS.getThreadProjection),
+);
+
+const preStartHandlers = (sessionId: AuthSessionId) =>
+  preStartRpcGroup.toLayer({
+    [ORCHESTRATION_V2_WS_METHODS.subscribePreStart]: (input) =>
+      Stream.unwrap(subscribeOrchestrationV2PreStart(input, sessionId)),
+    [ORCHESTRATION_V2_WS_METHODS.respondPreStart]: (input) =>
+      respondOrchestrationV2PreStart(input, sessionId),
+    [ORCHESTRATION_V2_WS_METHODS.continuePreStart]: (input) =>
+      continueOrchestrationV2PreStart(input),
+    [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: (input) =>
+      Stream.unwrap(subscribeOrchestrationV2Shell(input)),
+    // stands in for the server's bounded window over the same projection
+    [ORCHESTRATION_V2_WS_METHODS.getThreadProjection]: (input) =>
+      ThreadManagement.ThreadManagementService.pipe(
+        Effect.flatMap((threads) => threads.getThreadProjection(input.threadId)),
+        Effect.orDie,
+      ),
   });
 
-it.effect("keeps a failed held run's expiry when a later run is interrupted", () => {
+/**
+ * The server's `/ws` route with only the pre-start RPCs: the same ticket authentication,
+ * scope middleware and handlers, without the services the other RPCs need.
+ */
+const preStartSocketRoute = HttpRouter.add(
+  "GET",
+  "/ws",
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const url = HttpServerRequest.toURL(request);
+    if (Option.isNone(url) || !hasCompatibleOrchestrationProtocol(url.value)) {
+      return HttpServerResponse.empty({ status: 426 });
+    }
+    const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
+    const session = yield* environmentAuth.authenticateWebSocketUpgrade(request).pipe(
+      Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, (error) =>
+        failEnvironmentAuthInvalid(
+          EnvironmentAuth.serverAuthCredentialReason(error),
+          EnvironmentAuth.serverAuthDpopFailureReason(error),
+        ),
+      ),
+      Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+        failEnvironmentInternal("internal_error", error),
+      ),
+    );
+    const { protocol, httpEffect } = yield* RpcServer.makeProtocolWithHttpEffectWebsocket;
+    yield* RpcServer.make(preStartRpcGroup, WS_RPC_SERVER_OPTIONS).pipe(
+      Effect.provideService(RpcServer.Protocol, protocol),
+      Effect.provide(
+        Layer.merge(RpcAuthorization.layer(session.scopes), preStartHandlers(session.sessionId)),
+      ),
+      Effect.forkScoped,
+    );
+    return yield* httpEffect;
+  }).pipe(Effect.provide(RpcSerialization.layerJson)),
+);
+
+class PreStartAuthApi extends HttpApi.make("environment").add(EnvironmentHttpApi.groups.auth) {}
+
+/**
+ * Serves the environment's auth routes and the pre-start WebSocket route over real HTTP.
+ * `onSubscriptionClosed` runs once the server has closed a monitor's subscription.
+ */
+const servePreStartMonitors = (
+  options: { readonly onSubscriptionClosed?: Effect.Effect<void> } = {},
+) =>
+  Effect.gen(function* () {
+    const context = yield* Effect.context<
+      | PreStartMonitors.PreStartMonitors
+      | ThreadManagement.ThreadManagementService
+      | SqlClient.SqlClient
+    >();
+    const monitors = yield* PreStartMonitors.PreStartMonitors;
+    const enrichmentChanges = yield* PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>();
+    const shellServices = Layer.mergeAll(
+      OrchestrationEventStore.layer,
+      Layer.mock(ProjectStore.ProjectStoreV2)({
+        listShells: () =>
+          Effect.succeed([project, { ...otherProject, workspaceRoot: "/other-repo" }]),
+      }),
+      Layer.succeed(ProjectEnrichment.ProjectEnrichmentService, {
+        getAvailable: () =>
+          Effect.succeed({ repositoryIdentity: null, repositoryIdentityResolved: false }),
+        subscribeChanges: PubSub.subscribe(enrichmentChanges),
+      } as unknown as ProjectEnrichment.ProjectEnrichmentService["Service"]),
+      Layer.succeed(PreStartMonitors.PreStartMonitors, {
+        ...monitors,
+        // added to the subscription's scope before it registers, so it runs after its removal
+        subscribe: (input) =>
+          Stream.unwrap(
+            Effect.addFinalizer(() => options.onSubscriptionClosed ?? Effect.void).pipe(
+              Effect.as(monitors.subscribe(input)),
+            ),
+          ),
+      }),
+    );
+    const environmentAuth = EnvironmentAuth.layer.pipe(
+      Layer.provide(SqlitePersistence.layerMemory),
+      Layer.provideMerge(ServerSecretStore.layer),
+      Layer.provide(ServerEnvironment.layerIdentity),
+      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-pre-start-ws-" })),
+    );
+    const routes = Layer.mergeAll(
+      preStartSocketRoute,
+      HttpApiBuilder.layer(PreStartAuthApi).pipe(
+        Layer.provide(AuthHttp.layer),
+        Layer.provide(AuthHttp.layerAuthenticatedAuth),
+        Layer.provide(HttpPlatform.layer.pipe(Layer.provideMerge(Etag.layerWeak))),
+      ),
+    );
+    const server = yield* Layer.build(
+      HttpRouter.serve(routes, { disableListenLog: true }).pipe(
+        Layer.provide(shellServices),
+        Layer.provideMerge(environmentAuth),
+        Layer.provide(Layer.succeedContext(context)),
+        Layer.provideMerge(NodeHttpServer.layerTest),
+        Layer.provide(NodeServices.layer),
+      ),
+    );
+    const address = Context.get(server, HttpServer.HttpServer).address;
+    if (!("port" in address)) return yield* Effect.die("Expected a TCP server.");
+    const origin = `http://127.0.0.1:${address.port}`;
+    const auth = Context.get(server, EnvironmentAuth.EnvironmentAuth);
+    return {
+      origin,
+      auth,
+      /** A one-time pairing link like the one `t3 pair` prints. */
+      pairingUrl: (scopes: ReadonlyArray<AuthEnvironmentScope>) =>
+        auth
+          .createPairingLink({ scopes, subject: "one-time-token", label: "Pre-start monitor" })
+          .pipe(Effect.map((issued) => `${origin}/pair#token=${issued.credential}`)),
+      /** A WebSocket URL for a new connection of `sessionId`, through a fresh ticket. */
+      socketUrl: (sessionId: AuthSessionId) =>
+        auth.issueWebSocketTicket({ sessionId }).pipe(
+          Effect.map(({ ticket }) => {
+            const url = new URL("/ws", origin.replace("http:", "ws:"));
+            url.searchParams.set("wsTicket", ticket);
+            url.searchParams.set(
+              ORCHESTRATION_PROTOCOL_QUERY_PARAM,
+              String(ORCHESTRATION_PROTOCOL_VERSION),
+            );
+            return url.toString();
+          }),
+        ),
+    };
+  });
+
+/** A connection's pre-start frames, starting after its ready frame. */
+const subscribeOverSocket = (client: PreStartMonitorClient, project: ProjectId) =>
+  Effect.gen(function* () {
+    const frames = yield* Queue.unbounded<OrchestrationV2PreStartStreamItem>();
+    yield* client[ORCHESTRATION_V2_WS_METHODS.subscribePreStart]({ projectId: project }).pipe(
+      Stream.runForEach((item) => Queue.offer(frames, item)),
+      Effect.forkScoped,
+    );
+    const ready = yield* Queue.take(frames);
+    if (ready.kind !== "ready") return assert.fail("A subscription starts with its ready frame.");
+    return {
+      subscriptionId: ready.subscriptionId,
+      held: Queue.take(frames).pipe(
+        Effect.map((item) => (item.kind === "held" ? item : assert.fail("Expected a held run."))),
+      ),
+    };
+  });
+
+const monitorScopes = [AuthOrchestrationReadScope, AuthOrchestrationOperateScope];
+
+it.effect("refuses pre-start monitors without a ticket or without permission to operate", () => {
   const harness = makeHarness();
   return Effect.gen(function* () {
     const launches = yield* ThreadLaunch.ThreadLaunchService;
     const threads = yield* ThreadManagement.ThreadManagementService;
-    const outbox = yield* EffectOutbox.EffectOutboxV2;
-    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
-    const { held, threadId, runOf } = yield* failHeldLaunch("pre-start-other-interrupt");
-    const expiryStatus = outbox.listByCommandId(held.requestId).pipe(
-      Effect.map((effects) =>
-        effects.find((effect) => effect.request.type === "run.pre-start.expire"),
-      ),
-      Effect.map((effect) => effect?.status),
-    );
+    const server = yield* servePreStartMonitors();
+    const upgrade = (query: string) =>
+      HttpClient.get(`${server.origin}/ws?${query}`).pipe(
+        Effect.map((response) => response.status),
+        Effect.provide(FetchHttpClient.layer),
+      );
+    const protocol = `${ORCHESTRATION_PROTOCOL_QUERY_PARAM}=${ORCHESTRATION_PROTOCOL_VERSION}`;
+    assert.equal(yield* upgrade(protocol), 401);
+    assert.equal(yield* upgrade(`${protocol}&wsTicket=forged`), 401);
 
-    const second = firstMessage(threadId, "command:pre-start-other-interrupt:second");
-    yield* threads.dispatch(second);
-    const secondRun = (yield* threads.getThreadProjection(threadId)).runs.find(
-      (run) => run.userMessageId === second.messageId,
-    );
-    if (secondRun === undefined) return assert.fail("The second message creates its own run.");
-    assert.equal(secondRun.status, "starting");
-    yield* threads.dispatch({
-      type: "run.interrupt",
-      commandId: CommandId.make("command:pre-start-other-interrupt:interrupt"),
-      threadId,
-      runId: secondRun.id,
+    const reader = yield* server.auth.issueSession({ scopes: [AuthOrchestrationReadScope] });
+    const readOnly = yield* connectMonitorClient(yield* server.socketUrl(reader.sessionId));
+    const subscribed = yield* readOnly[ORCHESTRATION_V2_WS_METHODS.subscribePreStart]({
+      projectId,
+    }).pipe(Stream.runHead, Effect.flip);
+    assert.deepInclude(subscribed, {
+      _tag: "EnvironmentAuthorizationError",
+      requiredScope: AuthOrchestrationOperateScope,
     });
-    assert.equal(yield* expiryStatus, "pending");
 
-    // the retried run still starts when its wait expires
-    yield* launches.retryPreparation({
-      commandId: CommandId.make("command:pre-start-other-interrupt:retry"),
-      threadId,
-      runId: held.runId,
+    // the refused subscription holds nothing
+    const created = yield* launches.launch(
+      launchInput({ command: "launch:pre-start-read-only", thread: "thread:pre-start-read-only" }),
+    );
+    yield* threads.dispatch(firstMessage(created.threadId, "command:pre-start-read-only"));
+    const run = (yield* threads.getThreadProjection(created.threadId)).runs[0];
+    assert.isUndefined(run?.preStart);
+    const continued = yield* readOnly[ORCHESTRATION_V2_WS_METHODS.continuePreStart]({
+      threadId: created.threadId,
+      runId: run?.id ?? RunId.make("missing"),
+    }).pipe(Effect.flip);
+    assert.deepInclude(continued, {
+      _tag: "EnvironmentAuthorizationError",
+      requiredScope: AuthOrchestrationOperateScope,
     });
-    yield* awaitRun(threadId, held.runId, (run) => run.preStart?.workspaceReady === true);
-    yield* TestClock.adjust(Duration.minutes(2));
-    while ((yield* runOf)?.preStart?.status === "pending") {
-      if (!(yield* worker.runOnce)) break;
-    }
-    const run = yield* runOf;
-    assert.equal(run?.status, "starting");
-    assert.equal(run?.preStart?.status, "expired");
   }).pipe(Effect.provide(harness.layer));
 });
 
-it.effect("ends a failed held run's wait when its thread is stopped", () => {
-  const harness = makeHarness();
-  return Effect.gen(function* () {
-    const launches = yield* ThreadLaunch.ThreadLaunchService;
-    const threads = yield* ThreadManagement.ThreadManagementService;
-    const outbox = yield* EffectOutbox.EffectOutboxV2;
-    const { monitor, held, threadId, runOf } = yield* failHeldLaunch("pre-start-stop-failed");
+it.effect(
+  "answers a held first message over WebSocket only from its own session and project",
+  () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const server = yield* servePreStartMonitors();
+      const monitorSession = yield* server.auth.issueSession({ scopes: monitorScopes });
+      const otherSession = yield* server.auth.issueSession({ scopes: monitorScopes });
+      const monitorConnection = yield* connectMonitorClient(
+        yield* server.socketUrl(monitorSession.sessionId),
+      );
+      const otherConnection = yield* connectMonitorClient(
+        yield* server.socketUrl(otherSession.sessionId),
+      );
+      const monitor = yield* subscribeOverSocket(monitorConnection, projectId);
+      const otherProjectMonitor = yield* subscribeOverSocket(otherConnection, otherProjectId);
 
-    yield* threads.dispatch({
-      type: "thread.stop",
-      commandId: CommandId.make("command:pre-start-stop-failed:stop"),
-      threadId,
-    });
-    assert.equal((yield* runOf)?.preStart?.status, "expired");
-    assert.deepEqual(
-      (yield* outbox.listByCommandId(held.requestId))
-        .filter((effect) => effect.request.type === "run.pre-start.expire")
-        .map((effect) => effect.status),
-      ["cancelled"],
-    );
-    assert.isFalse(
-      (yield* threads.respondPreStart({
-        sessionId: monitorSessionId,
+      const created = yield* launches.launch(
+        launchInput({ command: "launch:pre-start-ws", thread: "thread:pre-start-ws" }),
+      );
+      yield* threads.dispatch(firstMessage(created.threadId, "command:pre-start-ws"));
+      const held = yield* monitor.held;
+      assert.equal(held.projectId, projectId);
+      assert.equal(held.text, "Fix the login bug");
+      const answer = {
         subscriptionId: monitor.subscriptionId,
-        threadId,
+        threadId: held.threadId,
         runId: held.runId,
         requestId: held.requestId,
         context: "Propose a plan before editing files.",
-      })).accepted,
-    );
+      };
+      const respond = ORCHESTRATION_V2_WS_METHODS.respondPreStart;
 
-    // a retry after Stop starts once its workspace is ready, without monitor context
-    yield* launches.retryPreparation({
-      commandId: CommandId.make("command:pre-start-stop-failed:retry"),
-      threadId,
-      runId: held.runId,
+      // another session cannot borrow this connection's subscription
+      assert.isFalse((yield* otherConnection[respond](answer)).accepted);
+      // a subscription the server never opened answers nothing
+      assert.isFalse(
+        (yield* monitorConnection[respond]({ ...answer, subscriptionId: "not-a-subscription" }))
+          .accepted,
+      );
+      // a monitor of another project cannot answer this one
+      assert.isFalse(
+        (yield* otherConnection[respond]({
+          ...answer,
+          subscriptionId: otherProjectMonitor.subscriptionId,
+        })).accepted,
+      );
+      assert.equal(
+        (yield* threads.getThreadProjection(created.threadId)).runs[0]?.status,
+        "preparing",
+      );
+
+      assert.isTrue((yield* monitorConnection[respond](answer)).accepted);
+      const projection = yield* threads.getThreadProjection(created.threadId);
+      assert.lengthOf(projection.runs, 1);
+      assert.equal(projection.runs[0]?.id, held.runId);
+      assert.equal(projection.runs[0]?.userMessageId, held.messageId);
+      assert.equal(projection.runs[0]?.status, "starting");
+      assert.equal(projection.runs[0]?.preStart?.context, "Propose a plan before editing files.");
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect("stops holding when a monitor disconnects, and its reconnection can still answer", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const monitors = yield* PreStartMonitors.PreStartMonitors;
+    const closed = yield* Deferred.make<void>();
+    const server = yield* servePreStartMonitors({
+      onSubscriptionClosed: Deferred.succeed(closed, undefined).pipe(Effect.asVoid),
     });
-    yield* awaitRun(threadId, held.runId, (run) => run.status === "starting");
-    assert.isUndefined((yield* runOf)?.preStart?.context);
+    const session = yield* server.auth.issueSession({ scopes: monitorScopes });
+    const firstConnection = yield* Scope.make();
+    const before = yield* Effect.gen(function* () {
+      return yield* subscribeOverSocket(
+        yield* connectMonitorClient(yield* server.socketUrl(session.sessionId)),
+        projectId,
+      );
+    }).pipe(Scope.provide(firstConnection));
+    const created = yield* launches.launch(
+      launchInput({ command: "launch:pre-start-reconnect", thread: "thread:pre-start-reconnect" }),
+    );
+    yield* threads.dispatch(firstMessage(created.threadId, "command:pre-start-reconnect"));
+    const held = yield* before.held;
+
+    yield* Scope.close(firstConnection, Exit.void);
+    yield* Deferred.await(closed);
+    assert.isTrue(Option.isNone(yield* monitors.holdDuration(projectId)));
+    const unwatched = yield* launches.launch(
+      launchInput({ command: "launch:pre-start-unwatched", thread: "thread:pre-start-unwatched" }),
+    );
+    yield* threads.dispatch(firstMessage(unwatched.threadId, "command:pre-start-unwatched"));
+    assert.isUndefined((yield* threads.getThreadProjection(unwatched.threadId)).runs[0]?.preStart);
+
+    const reconnected = yield* connectMonitorClient(yield* server.socketUrl(session.sessionId));
+    const answer = {
+      threadId: held.threadId,
+      runId: held.runId,
+      requestId: held.requestId,
+      context: "Propose a plan before editing files.",
+    };
+    const respond = ORCHESTRATION_V2_WS_METHODS.respondPreStart;
+    // the closed subscription no longer answers, even from the same session
+    assert.isFalse(
+      (yield* reconnected[respond]({ ...answer, subscriptionId: before.subscriptionId })).accepted,
+    );
+    // a new subscription only hears of later messages, but may answer one still waiting
+    const after = yield* subscribeOverSocket(reconnected, projectId);
+    assert.isTrue(
+      (yield* reconnected[respond]({ ...answer, subscriptionId: after.subscriptionId })).accepted,
+    );
+    const run = (yield* threads.getThreadProjection(created.threadId)).runs[0];
+    assert.equal(run?.status, "starting");
+    assert.equal(run?.preStart?.context, "Propose a plan before editing files.");
   }).pipe(Effect.provide(harness.layer));
 });
+
+it.effect(
+  "carries the reference monitor's briefing into the held run's first provider turn",
+  () => {
+    const provider = scriptedProvider();
+    const harness = makeHarness({ adapters: [provider.adapter] });
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      // active work started before the monitor listens, in this project and in another
+      yield* launches.launch(
+        launchInput({
+          command: "launch:briefing-busy",
+          thread: "thread:briefing-busy",
+          message: "Migrate the billing tables",
+        }),
+      );
+      yield* launches.launch(
+        launchInput({
+          command: "launch:briefing-elsewhere",
+          thread: "thread:briefing-elsewhere",
+          message: "Fix the signup bug",
+          project: otherProjectId,
+        }),
+      );
+
+      // the script's own path: pairing link, token exchange, ticket, project by folder
+      const server = yield* servePreStartMonitors();
+      const pairingUrl = yield* server.pairingUrl(monitorScopes);
+      const ready = yield* Deferred.make<void>();
+      yield* runBriefingMonitor({
+        pairingUrl: Redacted.make(pairingUrl),
+        project: project.workspaceRoot,
+        onReady: Deferred.succeed(ready, undefined).pipe(Effect.asVoid),
+      }).pipe(Effect.provide(FetchHttpClient.layer), Effect.forkScoped);
+      yield* Deferred.await(ready);
+
+      // the link works once, and a refused one is not echoed
+      const reused = yield* runBriefingMonitor({
+        pairingUrl: Redacted.make(pairingUrl),
+        project: project.workspaceRoot,
+      }).pipe(Effect.provide(FetchHttpClient.layer), Effect.scoped, Effect.flip);
+      assert.equal(reused._tag, "PreStartMonitorSetupError");
+      assert.notInclude(reused.message, new URL(pairingUrl).hash.slice("#token=".length));
+
+      const created = yield* launches.launch(
+        launchInput({ command: "launch:briefing-new", thread: "thread:briefing-new" }),
+      );
+      yield* threads.dispatch(firstMessage(created.threadId, "command:briefing-new"));
+      const held = (yield* threads.getThreadProjection(created.threadId)).runs[0];
+      if (held === undefined) return assert.fail("The first message creates a run.");
+      // the monitor names no budget, so the server's ten second default applies
+      assert.equal(
+        held.preStart?.expiresAt,
+        DateTime.formatIso(DateTime.addDuration(yield* DateTime.now, Duration.seconds(10))),
+      );
+      yield* awaitRun(created.threadId, held.id, (run) => run.status === "starting");
+
+      const preStart = (yield* threads.getThreadProjection(created.threadId)).runs[0]?.preStart;
+      assert.equal(preStart?.status, "released");
+      const briefing = preStart?.context ?? "";
+      assert.include(briefing, "Other active work in this project:");
+      assert.include(briefing, "Migrate the billing tables");
+      assert.notInclude(briefing, "Fix the signup bug");
+      assert.notInclude(briefing, "Fix the login bug");
+
+      // the original run's own start effect hands the briefing to the provider
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const heldTurn = () => provider.started.find((turn) => turn.threadId === created.threadId);
+      while (heldTurn() === undefined) {
+        if (!(yield* worker.runOnce))
+          return assert.fail("The held run's provider turn never started.");
+      }
+      const turn = heldTurn();
+      assert.equal(turn?.runId, held.id);
+      assert.equal(turn?.attemptId, held.activeAttemptId);
+      assert.equal(turn?.rootNodeId, held.rootNodeId);
+      assert.equal(turn?.message.messageId, held.userMessageId);
+      assert.equal(
+        turn?.message.text,
+        `<pre-start-context>\n${briefing}\n</pre-start-context>\n\nFix the login bug`,
+      );
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
 
 it.effect.each(
   (["codex", "claudeAgent"] as const).flatMap((driver) =>

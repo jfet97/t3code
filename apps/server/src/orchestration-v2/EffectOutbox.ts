@@ -115,8 +115,8 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     reason: Schema.optional(Schema.String),
   }),
   /**
-   * Due when a held first run stops waiting for pre-start monitors. A monitor's
-   * response cancels it; otherwise it releases the run.
+   * Due when a held first run stops waiting for pre-start monitors. A monitor's response,
+   * Continue, Stop or a failed preparation cancels it; otherwise it ends the wait.
    */
   Schema.Struct({
     type: Schema.Literal("run.pre-start.expire"),
@@ -136,7 +136,7 @@ export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
   "attachment.cleanup",
   "thread-title.generate",
   "delegated-tasks.stop",
-  // a failed run keeps its pre-start wait across a restart; a replay ends only a wait still pending
+  // a replay ends only a wait still pending, which restart recovery has already cancelled
   "run.pre-start.expire",
 ] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
 

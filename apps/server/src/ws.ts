@@ -61,6 +61,9 @@ import {
   OrchestrationV2GetShellSnapshotError,
   OrchestrationV2GetThreadProjectionError,
   OrchestrationV2PreStartError,
+  type OrchestrationV2ContinuePreStartInput,
+  type OrchestrationV2RespondPreStartInput,
+  type OrchestrationV2SubscribePreStartInput,
   OrchestrationV2ThreadLaunchError,
   type OrchestrationProjectShell,
   type OrchestrationV2ShellSnapshot,
@@ -930,6 +933,34 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
   },
 );
 
+/** A connection's pre-start monitor stream; its session is the only one that may answer it. */
+export const subscribeOrchestrationV2PreStart = Effect.fn("ws.orchestrationV2.subscribePreStart")(
+  function* (input: OrchestrationV2SubscribePreStartInput, sessionId: AuthSessionId) {
+    const preStartMonitors = yield* PreStartMonitors.PreStartMonitors;
+    return preStartMonitors
+      .subscribe({ ...input, sessionId })
+      .pipe(Stream.mapError((cause) => new OrchestrationV2PreStartError({ cause })));
+  },
+);
+
+export const respondOrchestrationV2PreStart = Effect.fn("ws.orchestrationV2.respondPreStart")(
+  function* (input: OrchestrationV2RespondPreStartInput, sessionId: AuthSessionId) {
+    const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+    return yield* threadManagement
+      .respondPreStart({ ...input, sessionId })
+      .pipe(Effect.mapError((cause) => new OrchestrationV2PreStartError({ cause })));
+  },
+);
+
+export const continueOrchestrationV2PreStart = Effect.fn("ws.orchestrationV2.continuePreStart")(
+  function* (input: OrchestrationV2ContinuePreStartInput) {
+    const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+    return yield* threadManagement
+      .continuePreStart(input)
+      .pipe(Effect.mapError((cause) => new OrchestrationV2PreStartError({ cause })));
+  },
+);
+
 export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subscribeShell")(
   function* (input: {
     readonly afterSequence?: number;
@@ -1207,7 +1238,6 @@ const layerWsRpc = (
       const deviceHostContext =
         yield* Effect.context<Effect.Services<ReturnType<typeof remoteSshDeviceHosts>>>();
       const orchestrationEngine = yield* Orchestrator.OrchestratorV2;
-      const preStartMonitors = yield* PreStartMonitors.PreStartMonitors;
       const crypto = yield* Crypto.Crypto;
       const serverCommandId = (tag: string) =>
         crypto.randomUUIDv4().pipe(
@@ -2023,13 +2053,11 @@ const layerWsRpc = (
             ),
           ),
         [ORCHESTRATION_V2_WS_METHODS.subscribePreStart]: (input) =>
-          preStartMonitors
-            .subscribe({ ...input, sessionId: currentSessionId })
-            .pipe(Stream.mapError((cause) => new OrchestrationV2PreStartError({ cause }))),
+          Stream.unwrap(subscribeOrchestrationV2PreStart(input, currentSessionId)),
         [ORCHESTRATION_V2_WS_METHODS.respondPreStart]: (input) =>
-          threadManagement
-            .respondPreStart({ ...input, sessionId: currentSessionId })
-            .pipe(Effect.mapError((cause) => new OrchestrationV2PreStartError({ cause }))),
+          respondOrchestrationV2PreStart(input, currentSessionId),
+        [ORCHESTRATION_V2_WS_METHODS.continuePreStart]: (input) =>
+          continueOrchestrationV2PreStart(input),
         [ORCHESTRATION_V2_WS_METHODS.subscribeCommandOutput]: (input) =>
           Stream.unwrap(
             Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(

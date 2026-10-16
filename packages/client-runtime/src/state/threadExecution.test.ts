@@ -1,4 +1,5 @@
 import {
+  CommandId,
   TurnItemId,
   NodeId,
   MessageId,
@@ -17,6 +18,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { v2Projection } from "./orchestrationV2TestFixtures.ts";
 import {
+  derivePreStartWait,
   presentPendingBackgroundWork,
   presentProviderGoal,
   deriveReportedModelSelection,
@@ -54,6 +56,25 @@ function run(id: string, ordinal: number, status: OrchestrationV2RunStatus) {
 }
 
 describe("thread execution presentation", () => {
+  it("shows a pre-start wait only while the first run still waits for its monitors", () => {
+    const preStart = {
+      requestId: CommandId.make("command:first"),
+      expiresAt: "2026-07-28T10:02:00.000Z",
+      status: "pending" as const,
+      workspaceReady: false,
+    };
+    const held = { ...run("held", 1, "preparing"), preStart };
+    expect(derivePreStartWait({ runs: [held] })).toEqual({
+      runId: held.id,
+      expiresAt: "2026-07-28T10:02:00.000Z",
+    });
+    expect(
+      derivePreStartWait({ runs: [{ ...held, preStart: { ...preStart, status: "expired" } }] }),
+    ).toBeNull();
+    expect(derivePreStartWait({ runs: [{ ...held, status: "interrupted" as const }] })).toBeNull();
+    expect(derivePreStartWait({ runs: [run("plain", 1, "preparing")] })).toBeNull();
+  });
+
   it("derives the current root failure without inheriting errors from children or previous runs", () => {
     const failed = { ...run("limited", 1, "failed"), rootNodeId: NodeId.make("root") };
     const item = {

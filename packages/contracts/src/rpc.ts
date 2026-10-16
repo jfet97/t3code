@@ -1719,6 +1719,15 @@ const WsOrchestrationV2RespondPreStartRpc = Rpc.make(ORCHESTRATION_V2_WS_METHODS
   error: Schema.Union([OrchestrationV2PreStartError, EnvironmentAuthorizationError]),
 });
 
+const WsOrchestrationV2ContinuePreStartRpc = Rpc.make(
+  ORCHESTRATION_V2_WS_METHODS.continuePreStart,
+  {
+    payload: OrchestrationV2RpcSchemas.continuePreStart.input,
+    success: OrchestrationV2RpcSchemas.continuePreStart.output,
+    error: Schema.Union([OrchestrationV2PreStartError, EnvironmentAuthorizationError]),
+  },
+);
+
 const WsOrchestrationV2SubscribeCommandOutputRpc = Rpc.make(
   ORCHESTRATION_V2_WS_METHODS.subscribeCommandOutput,
   {
@@ -2063,5 +2072,6 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SubscribeThreadRpc,
   WsOrchestrationV2SubscribePreStartRpc,
   WsOrchestrationV2RespondPreStartRpc,
+  WsOrchestrationV2ContinuePreStartRpc,
   WsOrchestrationV2SubscribeCommandOutputRpc,
 ).middleware(RpcScopeAuthorization);

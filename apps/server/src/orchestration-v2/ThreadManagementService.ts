@@ -20,6 +20,8 @@ import {
   type OrchestrationV2GetTurnItemResult,
   type OrchestrationV2RespondPreStartInput,
   type OrchestrationV2RespondPreStartResult,
+  type OrchestrationV2ContinuePreStartInput,
+  type OrchestrationV2ContinuePreStartResult,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2CreationSource,
@@ -338,6 +340,13 @@ export interface ThreadManagementServiceShape {
     input: OrchestrationV2RespondPreStartInput & { readonly sessionId: AuthSessionId },
   ) => Effect.Effect<
     OrchestrationV2RespondPreStartResult,
+    Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
+  >;
+  /** Starts a held first message without waiting for its monitors; a no-op once the wait ended. */
+  readonly continuePreStart: (
+    input: OrchestrationV2ContinuePreStartInput,
+  ) => Effect.Effect<
+    OrchestrationV2ContinuePreStartResult,
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
   >;
   readonly getThreadHistoryPage: Orchestrator.OrchestratorV2["Service"]["getThreadHistoryPage"];
@@ -716,6 +725,19 @@ const make = Effect.gen(function* () {
       Effect.catchTags({
         OrchestratorCommandRejectedError: () => Effect.succeed({ accepted: false }),
       }),
+    );
+
+  const continuePreStart: ThreadManagementServiceShape["continuePreStart"] = (input) =>
+    randomUuidV4.pipe(
+      Effect.flatMap((id) =>
+        dispatch({
+          type: "run.pre-start.continue",
+          commandId: CommandId.make(`pre-start-continue:${input.runId}:${id}`),
+          threadId: input.threadId,
+          runId: input.runId,
+        }),
+      ),
+      Effect.map((result) => ({ continued: result.storedEvents.length > 0 })),
     );
 
   const getProjectThread: ThreadManagementServiceShape["getProjectThread"] = (input) =>
@@ -1175,6 +1197,7 @@ const make = Effect.gen(function* () {
       ),
     dispatch,
     respondPreStart,
+    continuePreStart,
     getThreadHistoryPage: (threadId, cursor, throughEntryId, conversationOnly) =>
       ensureProjectionTranscript(threadId).pipe(
         Effect.andThen(

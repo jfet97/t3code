@@ -1,8 +1,11 @@
+import { useAtomValue } from "@effect/atom-react";
 import * as Dialog from "../../components/ui/Dialog";
 import { useOpenPullRequest } from "../../native/useOpenPullRequest";
 import { makeTurnCommandMetadata } from "../../lib/commandMetadata";
 import { buildProjectThreadStartTurnInput } from "../../lib/projectThreadStartTurn";
 import { useWorktreeSetup } from "./use-worktree-setup";
+import { stopStartingThread } from "./worktree-setup-state";
+import { derivePreStartWait } from "@t3tools/client-runtime/state/thread-execution";
 import { worktreeSetupAgentStarted } from "@t3tools/client-runtime/worktree-setup";
 import { AppBar } from "../../components/ui/AppBar";
 import {
@@ -21,6 +24,7 @@ import {
   EnvironmentId,
   ThreadId,
   type ProjectScript,
+  type RunId,
 } from "@t3tools/contracts";
 import {
   projectScriptCwd,
@@ -610,22 +614,21 @@ function ThreadRouteContent(
   const handleOpenConnectionEditor = useCallback(() => {
     void navigation.navigate("Connections");
   }, [navigation]);
-  const handleStopThread = useCallback(() => {
-    if (
-      !selectedThread ||
-      !readEnvironmentScope(selectedThread.environmentId, AuthOrchestrationOperateScope) ||
-      composer.interruptibleRunId === null
-    ) {
-      return;
-    }
-    return interruptThreadTurn({
-      environmentId: selectedThread.environmentId,
-      input: {
-        threadId: selectedThread.id,
-        runId: composer.interruptibleRunId,
-      },
-    });
-  }, [composer.interruptibleRunId, interruptThreadTurn, selectedThread]);
+  const handleStopThread = useCallback(
+    (runId: RunId | undefined) => {
+      if (
+        !selectedThread ||
+        !readEnvironmentScope(selectedThread.environmentId, AuthOrchestrationOperateScope)
+      ) {
+        return;
+      }
+      return interruptThreadTurn({
+        environmentId: selectedThread.environmentId,
+        input: { threadId: selectedThread.id, ...(runId === undefined ? {} : { runId }) },
+      });
+    },
+    [interruptThreadTurn, selectedThread],
+  );
 
   const handleOpenTerminal = useCallback(
     (nextTerminalId?: string | null) => {
@@ -857,6 +860,31 @@ function ThreadRouteContent(
       ? worktreeSetup.phase === "running" && !worktreeSetupAgentStarted(worktreeSetup)
       : (selectedThreadDetail?.runs.some((run) => run.status === "preparing") ?? false);
   const cancelWorktreeSetup = useAtomCommand(vcsEnvironment.cancelWorktreeSetup);
+  const preStartWait =
+    selectedThreadDetail === null ? null : derivePreStartWait(selectedThreadDetail);
+  const continueWithoutPreStartMonitor = useAtomCommand(
+    threadEnvironment.continueWithoutPreStartMonitor,
+    "continue without monitor",
+  );
+  const canContinueWithoutPreStartMonitor = useAtomValue(
+    threadEnvironment.continueWithoutPreStartMonitor.permissionAtom(
+      selectedThread?.environmentId ?? null,
+    ),
+  );
+  const [continuingPreStartRunId, setContinuingPreStartRunId] = useState<RunId | null>(null);
+  const preStartRunId = preStartWait?.runId ?? null;
+  const handleContinueWithoutPreStartMonitor = async () => {
+    if (!selectedThread || preStartRunId === null) return;
+    setContinuingPreStartRunId(preStartRunId);
+    try {
+      await continueWithoutPreStartMonitor({
+        environmentId: selectedThread.environmentId,
+        input: { threadId: selectedThread.id, runId: preStartRunId },
+      });
+    } finally {
+      setContinuingPreStartRunId((current) => (current === preStartRunId ? null : current));
+    }
+  };
   const handleCancelWorktreeSetup = useCallback(() => {
     if (!selectedThread) return;
     void cancelWorktreeSetup({
@@ -989,6 +1017,20 @@ function ThreadRouteContent(
           runlessWorkActive={composer.runlessWorkActive}
           providerSubagentStatus={composer.providerSubagentStatus}
           creationState={creationState}
+          preStartWait={
+            preStartWait === null
+              ? null
+              : {
+                  deadlineLabel: new Date(preStartWait.expiresAt).toLocaleTimeString([], {
+                    hour: "numeric",
+                    minute: "2-digit",
+                    second: "2-digit",
+                  }),
+                  canContinue: canContinueWithoutPreStartMonitor,
+                  continuing: continuingPreStartRunId === preStartWait.runId,
+                  onContinue: () => void handleContinueWithoutPreStartMonitor(),
+                }
+          }
           setupWorkingStartedAt={
             composer.activeWorkStartedAt !== null &&
             worktreeSetupSnapshot !== null &&
@@ -1046,7 +1088,21 @@ function ThreadRouteContent(
           onNativePasteText={composer.onNativePasteText}
           onRemoveDraftImage={composer.onRemoveDraftImage}
           serverConfig={serverConfig}
-          onStopThread={awaitingBootstrapTurn ? handleCancelWorktreeSetup : handleStopThread}
+          onStopThread={() =>
+            void stopStartingThread({
+              worktreeSetup,
+              knownRunId: composer.interruptibleRunId,
+              cancelSetup: async () => {
+                if (!selectedThread) return false;
+                const result = await cancelWorktreeSetup({
+                  environmentId: selectedThread.environmentId,
+                  input: { threadId: selectedThread.id },
+                });
+                return result._tag === "Success" && result.value.cancelled;
+              },
+              interruptRun: async (runId) => handleStopThread(runId),
+            })
+          }
           onSendMessage={composer.onSendMessage}
           onReconnectEnvironment={handleReconnectEnvironment}
           canSwitchThreadProvider={composer.canSwitchThreadProvider}

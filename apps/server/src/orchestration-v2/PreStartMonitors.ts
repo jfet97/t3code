@@ -3,6 +3,7 @@ import type {
   OrchestrationV2PreStartStreamItem,
   OrchestrationV2Run,
   OrchestrationV2RunPreStart,
+  ProjectId,
 } from "@t3tools/contracts";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import * as Context from "effect/Context";
@@ -17,27 +18,31 @@ import * as Stream from "effect/Stream";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
-const DEFAULT_HOLD_MS = 120_000;
+const DEFAULT_HOLD_MS = 10_000;
 const MAX_HOLD_MS = 120_000;
 
 /**
- * Connections subscribed as pre-start monitors. While one is subscribed, a new thread's
- * first message waits before its provider turn starts (see `OrchestrationV2RunPreStart`),
- * and every subscription hears about it.
+ * Connections subscribed as pre-start monitors of one project each. While one is subscribed,
+ * a new thread's first message in that project waits before its provider turn starts (see
+ * `OrchestrationV2RunPreStart`), and every subscription of that project hears about it.
  */
 export class PreStartMonitors extends Context.Service<
   PreStartMonitors,
   {
-    /** How long a first run held now waits; none while no monitor is subscribed. */
-    readonly holdDuration: Effect.Effect<Option.Option<Duration.Duration>>;
-    /** Whether `subscriptionId` is still open and belongs to `sessionId`. */
+    /** How long a first run held now in `projectId` waits; none without a monitor of it. */
+    readonly holdDuration: (
+      projectId: ProjectId,
+    ) => Effect.Effect<Option.Option<Duration.Duration>>;
+    /** Whether `subscriptionId` is still open, belongs to `sessionId` and monitors `projectId`. */
     readonly isSubscribed: (input: {
       readonly sessionId: AuthSessionId;
       readonly subscriptionId: string;
+      readonly projectId: ProjectId;
     }) => Effect.Effect<boolean>;
-    /** A ready frame, then every first run held from then on, until the stream ends. */
+    /** A ready frame, then every first run held in `projectId` until the stream ends. */
     readonly subscribe: (input: {
       readonly sessionId: AuthSessionId;
+      readonly projectId: ProjectId;
       readonly holdMs?: number | undefined;
     }) => Stream.Stream<
       OrchestrationV2PreStartStreamItem,
@@ -50,39 +55,60 @@ const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
   const subscriptions = yield* Ref.make<
-    ReadonlyMap<string, { readonly sessionId: AuthSessionId; readonly holdMs: number }>
+    ReadonlyMap<
+      string,
+      {
+        readonly sessionId: AuthSessionId;
+        readonly projectId: ProjectId;
+        readonly holdMs: number;
+      }
+    >
   >(new Map());
 
-  const holdDuration = Ref.get(subscriptions).pipe(
-    Effect.map((current) =>
-      current.size === 0
-        ? Option.none()
-        : Option.some(
-            Duration.millis(
-              Math.max(...Array.from(current.values(), (subscription) => subscription.holdMs)),
-            ),
-          ),
-    ),
-  );
+  const holdDuration: PreStartMonitors["Service"]["holdDuration"] = (projectId) =>
+    Ref.get(subscriptions).pipe(
+      Effect.map((current) => {
+        const budgets = Array.from(current.values()).flatMap((subscription) =>
+          subscription.projectId === projectId ? [subscription.holdMs] : [],
+        );
+        return budgets.length === 0
+          ? Option.none()
+          : Option.some(Duration.millis(Math.max(...budgets)));
+      }),
+    );
 
   const isSubscribed: PreStartMonitors["Service"]["isSubscribed"] = (input) =>
     Ref.get(subscriptions).pipe(
-      Effect.map((current) => current.get(input.subscriptionId)?.sessionId === input.sessionId),
+      Effect.map((current) => {
+        const subscription = current.get(input.subscriptionId);
+        return (
+          subscription?.sessionId === input.sessionId && subscription.projectId === input.projectId
+        );
+      }),
     );
 
-  const heldRun = (run: OrchestrationV2Run, preStart: OrchestrationV2RunPreStart) =>
+  const heldRun = (
+    run: OrchestrationV2Run,
+    preStart: OrchestrationV2RunPreStart,
+    projectId: ProjectId,
+  ) =>
     projectionStore
       .getThreadRecords(run.threadId, ["messages"], { messageIds: [run.userMessageId] })
       .pipe(
-        Effect.map((records): OrchestrationV2PreStartStreamItem => ({
-          kind: "held",
-          threadId: run.threadId,
-          runId: run.id,
-          messageId: run.userMessageId,
-          requestId: preStart.requestId,
-          expiresAt: preStart.expiresAt,
-          text: records.messages[0]?.text ?? "",
-        })),
+        Effect.map((records): Option.Option<OrchestrationV2PreStartStreamItem> =>
+          records.thread.projectId !== projectId
+            ? Option.none()
+            : Option.some({
+                kind: "held",
+                projectId,
+                threadId: run.threadId,
+                runId: run.id,
+                messageId: run.userMessageId,
+                requestId: preStart.requestId,
+                expiresAt: preStart.expiresAt,
+                text: records.messages[0]?.text ?? "",
+              }),
+        ),
       );
 
   const subscribe: PreStartMonitors["Service"]["subscribe"] = (input) =>
@@ -95,6 +121,7 @@ const make = Effect.gen(function* () {
           Ref.update(subscriptions, (current) =>
             new Map(current).set(subscriptionId, {
               sessionId: input.sessionId,
+              projectId: input.projectId,
               holdMs: Math.min(MAX_HOLD_MS, input.holdMs ?? DEFAULT_HOLD_MS),
             }),
           ),
@@ -117,7 +144,10 @@ const make = Effect.gen(function* () {
                   })
                 : Result.failVoid,
             ),
-            Stream.mapEffect(({ run, preStart }) => heldRun(run, preStart)),
+            Stream.mapEffect(({ run, preStart }) => heldRun(run, preStart, input.projectId)),
+            Stream.filterMap((item) =>
+              Option.isSome(item) ? Result.succeed(item.value) : Result.failVoid,
+            ),
           );
         return Stream.concat(
           Stream.succeed<OrchestrationV2PreStartStreamItem>({ kind: "ready", subscriptionId }),

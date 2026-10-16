@@ -105,6 +105,7 @@ import {
   deriveRunlessWorkStartedAt,
   deriveThreadActivityRun,
   deriveLatestThreadRun,
+  derivePreStartWait,
   deriveThreadRuntime,
   presentPendingBackgroundWork,
   presentProviderGoal,
@@ -314,6 +315,7 @@ import {
   ChevronDownIcon,
   DownloadIcon,
   GitBranchIcon,
+  HourglassIcon,
   ShieldQuestionIcon,
   TargetIcon,
   WifiOffIcon,
@@ -499,7 +501,11 @@ import {
 import { useLinkedThreadPullRequest } from "./ThreadStatusIndicators";
 import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import { ThreadStatusLine } from "./chat/ThreadStatusLine";
-import { formatRelativeTimeLabel, formatRelativeTimeUntilLabel } from "../timestampFormat";
+import {
+  formatRelativeTimeLabel,
+  formatRelativeTimeUntilLabel,
+  formatTimestamp,
+} from "../timestampFormat";
 import { ComposerSurface } from "./chat/ComposerSurface";
 import { resolveThreadSyncPhase } from "../threadSync";
 import {
@@ -6940,6 +6946,48 @@ export default function ChatView(props: ChatViewProps) {
     }
   };
   const handleUnsnoozeActiveThreadStable = useStableCallback(handleUnsnoozeActiveThread);
+  const preStartWait = useMemo(
+    () => (serverProjection === null ? null : derivePreStartWait(serverProjection)),
+    [serverProjection],
+  );
+  const continueWithoutPreStartMonitor = useAtomCommand(
+    threadEnvironment.continueWithoutPreStartMonitor,
+    { reportFailure: false },
+  );
+  const canContinueWithoutPreStartMonitor = useAtomValue(
+    threadEnvironment.continueWithoutPreStartMonitor.permissionAtom(
+      activeThreadRef?.environmentId ?? null,
+    ),
+  );
+  const [continuingPreStartRunId, setContinuingPreStartRunId] = useState<RunId | null>(null);
+  const isContinuingPreStart =
+    preStartWait !== null && continuingPreStartRunId === preStartWait.runId;
+  const handleContinueWithoutPreStartMonitor = async () => {
+    if (!activeThreadRef || preStartWait === null) return;
+    const runId = preStartWait.runId;
+    setContinuingPreStartRunId(runId);
+    try {
+      const result = await continueWithoutPreStartMonitor({
+        environmentId: activeThreadRef.environmentId,
+        input: { threadId: activeThreadRef.threadId, runId },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Failed to continue without the monitor",
+            description: error instanceof Error ? error.message : "An error occurred.",
+          }),
+        );
+      }
+    } finally {
+      setContinuingPreStartRunId((current) => (current === runId ? null : current));
+    }
+  };
+  const handleContinueWithoutPreStartMonitorStable = useStableCallback(
+    handleContinueWithoutPreStartMonitor,
+  );
   const [isRestoringThreadBranch, setIsRestoringThreadBranch] = useState(false);
   const [branchRestoreConfirmOpen, setBranchRestoreConfirmOpen] = useState(false);
   const [revealedBranchMismatchKey, setRevealedBranchMismatchKey] = useState<string | null>(null);
@@ -7274,7 +7322,16 @@ export default function ChatView(props: ChatViewProps) {
   ]);
   const threadStatusLine = useMemo(() => {
     void nowMinute;
-    return activeThreadSnoozed ? (
+    return preStartWait !== null ? (
+      <ThreadStatusLine
+        icon={<HourglassIcon />}
+        label="Waiting for monitor until"
+        detail={formatTimestamp(preStartWait.expiresAt, timestampFormat)}
+        actionLabel={isContinuingPreStart ? "Continuing..." : "Continue without monitor"}
+        actionDisabled={!canContinueWithoutPreStartMonitor || isContinuingPreStart}
+        onAction={() => void handleContinueWithoutPreStartMonitorStable()}
+      />
+    ) : activeThreadSnoozed ? (
       <ThreadStatusLine
         icon={<AlarmClockIcon />}
         label={
@@ -7309,16 +7366,21 @@ export default function ChatView(props: ChatViewProps) {
   }, [
     acknowledgeActiveThreadWokeStable,
     activeThreadSettled,
+    canContinueWithoutPreStartMonitor,
     activeThreadShell?.settledAt,
     activeThreadShell?.snoozedUntil,
     activeThreadSnoozed,
     activeThreadWokeVisible,
     canOperateThread,
+    handleContinueWithoutPreStartMonitorStable,
     handleUnsettleActiveThreadStable,
     handleUnsnoozeActiveThreadStable,
+    isContinuingPreStart,
     isUnsettling,
     isUnsnoozing,
     nowMinute,
+    preStartWait,
+    timestampFormat,
   ]);
   const activeThreadHasCompactableConversation = serverVisibleTurnItems.some(
     ({ item }) =>

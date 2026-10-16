@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import { Atom } from "effect/reactivity";
 import {
+  ORCHESTRATION_V2_WS_METHODS,
   WS_METHODS,
   type EnvironmentId,
   type OrchestrationV2ShellSnapshot,
@@ -363,6 +364,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     retryWorkspacePreparation: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:retry-workspace-preparation",
       execute: (input: RetryWorkspacePreparationInput) => retryWorkspacePreparation(input),
+      scheduler,
+      concurrency,
+    }),
+    continueWithoutPreStartMonitor: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:thread:continue-without-pre-start-monitor",
+      tag: ORCHESTRATION_V2_WS_METHODS.continuePreStart,
       scheduler,
       concurrency,
     }),

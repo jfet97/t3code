@@ -15,6 +15,7 @@ import {
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ThreadProjection,
   orchestrationV2RunWorkStartedAt,
+  type RunId,
   type ThreadId,
 } from "@t3tools/contracts";
 import {
@@ -90,6 +91,19 @@ export function deriveLatestThreadRun(
 ): ThreadRunSummary | null {
   const run = presentedLatestRun(projection);
   return run === null ? null : summarizeThreadRun(projection, run);
+}
+
+/**
+ * The first run waiting for its project's pre-start monitors, and when they stop being able
+ * to answer. The run may still wait for its workspace after that.
+ */
+export function derivePreStartWait(
+  projection: Pick<OrchestrationV2ThreadProjection, "runs">,
+): { readonly runId: RunId; readonly expiresAt: string } | null {
+  const run = projection.runs.find(
+    (candidate) => candidate.status === "preparing" && candidate.preStart?.status === "pending",
+  );
+  return run?.preStart === undefined ? null : { runId: run.id, expiresAt: run.preStart.expiresAt };
 }
 
 export function deriveThreadActivityRun(
