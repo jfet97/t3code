@@ -17,8 +17,8 @@ import * as Stream from "effect/Stream";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
-const DEFAULT_HOLD_MS = 10_000;
-const MAX_HOLD_MS = 30_000;
+const DEFAULT_HOLD_MS = 120_000;
+const MAX_HOLD_MS = 120_000;
 
 /**
  * Connections subscribed as pre-start monitors. While one is subscribed, a new thread's

@@ -2836,22 +2836,24 @@ it.effect("replays an accepted message.dispatch after the project disables the i
 const monitorSessionId = AuthSessionId.make("session:pre-start-monitor");
 
 /** Subscribes as a pre-start monitor; runs are held for it once this returns. */
-const subscribePreStart = Effect.gen(function* () {
-  const monitors = yield* PreStartMonitors.PreStartMonitors;
-  const items = yield* Queue.unbounded<OrchestrationV2PreStartStreamItem>();
-  yield* monitors.subscribe({ sessionId: monitorSessionId }).pipe(
-    Stream.runForEach((item) => Queue.offer(items, item)),
-    Effect.forkScoped,
-  );
-  const ready = yield* Queue.take(items);
-  if (ready.kind !== "ready") return assert.fail("A subscription starts with its ready frame.");
-  return {
-    subscriptionId: ready.subscriptionId,
-    held: Queue.take(items).pipe(
-      Effect.map((item) => (item.kind === "held" ? item : assert.fail("Expected a held run."))),
-    ),
-  };
-});
+const subscribePreStartFor = (holdMs?: number) =>
+  Effect.gen(function* () {
+    const monitors = yield* PreStartMonitors.PreStartMonitors;
+    const items = yield* Queue.unbounded<OrchestrationV2PreStartStreamItem>();
+    yield* monitors.subscribe({ sessionId: monitorSessionId, holdMs }).pipe(
+      Stream.runForEach((item) => Queue.offer(items, item)),
+      Effect.forkScoped,
+    );
+    const ready = yield* Queue.take(items);
+    if (ready.kind !== "ready") return assert.fail("A subscription starts with its ready frame.");
+    return {
+      subscriptionId: ready.subscriptionId,
+      held: Queue.take(items).pipe(
+        Effect.map((item) => (item.kind === "held" ? item : assert.fail("Expected a held run."))),
+      ),
+    };
+  });
+const subscribePreStart = subscribePreStartFor();
 
 /** Resolves once the run matches, from its current state or a later stored update. */
 const awaitRun = (
@@ -2990,12 +2992,47 @@ it.effect("releases a held first message unchanged when no monitor answers in ti
     );
     assert.isEmpty(yield* outbox.listByCommandId(release));
 
-    yield* TestClock.adjust(Duration.seconds(11));
+    // a monitor that names no budget holds the run for two minutes
+    yield* TestClock.adjust(Duration.millis(119_999));
+    assert.isFalse(yield* worker.runOnce);
+    yield* TestClock.adjust(Duration.millis(1));
     assert.isTrue(yield* worker.runOnce);
     const run = (yield* threads.getThreadProjection(created.threadId)).runs[0];
     assert.equal(run?.status, "starting");
     assert.equal(run?.preStart?.status, "expired");
     assert.isUndefined(run?.preStart?.context);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("holds a first message for its monitors' longest budget, at most two minutes", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const heldUntil = (budget: Duration.Duration) =>
+      DateTime.now.pipe(Effect.map((now) => DateTime.formatIso(DateTime.addDuration(now, budget))));
+    const first = yield* launches.launch(
+      launchInput({ command: "launch:pre-start-budget", thread: "thread:pre-start-budget" }),
+    );
+    const short = yield* subscribePreStartFor(5_000);
+    yield* threads.dispatch(firstMessage(first.threadId, "command:pre-start-budget"));
+    const shortHeld = yield* short.held;
+    assert.equal(shortHeld.expiresAt, yield* heldUntil(Duration.seconds(5)));
+
+    // a longer budget applies to runs held from now on, capped at two minutes
+    const long = yield* subscribePreStartFor(600_000);
+    const second = yield* launches.launch(
+      launchInput({
+        command: "launch:pre-start-budget-long",
+        thread: "thread:pre-start-budget-long",
+      }),
+    );
+    yield* threads.dispatch(firstMessage(second.threadId, "command:pre-start-budget-long"));
+    assert.equal((yield* long.held).expiresAt, yield* heldUntil(Duration.minutes(2)));
+    assert.equal(
+      (yield* threads.getThreadProjection(first.threadId)).runs[0]?.preStart?.expiresAt,
+      shortHeld.expiresAt,
+    );
   }).pipe(Effect.provide(harness.layer));
 });
 
@@ -3098,8 +3135,8 @@ it.effect("accepts a pre-start answer only from its open subscription before the
       "preparing",
     );
 
-    // past the deadline, an answer releases the run without its context
-    yield* TestClock.adjust(Duration.seconds(11));
+    // from the deadline on, an answer releases the run without its context
+    yield* TestClock.adjust(Duration.minutes(2));
     assert.isFalse((yield* threads.respondPreStart(answer)).accepted);
     const run = (yield* threads.getThreadProjection(created.threadId)).runs[0];
     assert.equal(run?.status, "starting");
@@ -3297,7 +3334,7 @@ it.effect("keeps a failed held run's expiry when a later run is interrupted", ()
       runId: held.runId,
     });
     yield* awaitRun(threadId, held.runId, (run) => run.preStart?.workspaceReady === true);
-    yield* TestClock.adjust(Duration.seconds(11));
+    yield* TestClock.adjust(Duration.minutes(2));
     while ((yield* runOf)?.preStart?.status === "pending") {
       if (!(yield* worker.runOnce)) break;
     }

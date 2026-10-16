@@ -3230,7 +3230,7 @@ export type OrchestrationV2SubscribeThreadInput = typeof OrchestrationV2Subscrib
  * turn starts, so a monitor can add context with `respondPreStart`.
  */
 export const OrchestrationV2SubscribePreStartInput = Schema.Struct({
-  /** How long a held run waits for this monitor; the server bounds it. */
+  /** Milliseconds a held run waits for this monitor: 120000 when omitted, and never more. */
   holdMs: Schema.optionalKey(PositiveInt),
 });
 export type OrchestrationV2SubscribePreStartInput =
