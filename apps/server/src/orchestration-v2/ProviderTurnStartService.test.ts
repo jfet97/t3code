@@ -3,6 +3,7 @@ import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
 import {
   CheckpointScopeId,
+  CommandId,
   MessageId,
   NodeId,
   ProviderSessionId,
@@ -14,6 +15,7 @@ import {
   RunId,
   ThreadId,
   ProjectId,
+  type OrchestrationV2RunPreStart,
   type OrchestrationV2ThreadProjection,
   OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
@@ -177,6 +179,8 @@ function makeLocalCommandHarness(input: {
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
   readonly failReadsAfterRunning?: boolean;
+  readonly preStart?: OrchestrationV2RunPreStart;
+  readonly attemptReason?: OrchestrationV2ThreadProjection["attempts"][number]["reason"];
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
   const threadId = ThreadId.make("thread-native-account-command");
@@ -206,6 +210,7 @@ function makeLocalCommandHarness(input: {
     completedAt: null,
     checkpointId: null,
     contextHandoffId: null,
+    ...(input.preStart === undefined ? {} : { preStart: input.preStart }),
   };
   const providerThread: OrchestrationV2ThreadProjection["providerThreads"][number] = {
     id: providerThreadId,
@@ -270,7 +275,7 @@ function makeLocalCommandHarness(input: {
         providerInstanceId: newInstanceId,
         providerThreadId,
         providerTurnId: null,
-        reason: "initial",
+        reason: input.attemptReason ?? "initial",
         status: "pending",
         startedAt: null,
         completedAt: null,
@@ -1042,3 +1047,43 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+const releasedPreStart: OrchestrationV2RunPreStart = {
+  requestId: CommandId.make("command-native-account-command"),
+  expiresAt: "2026-09-04T12:00:10.000Z",
+  status: "released",
+  workspaceReady: true,
+  context: "Propose a plan before editing files.",
+};
+
+effectIt.effect("sends a pre-start monitor's context ahead of the first message", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Fix the login bug",
+      failReadsAfterRunning: true,
+      preStart: releasedPreStart,
+    });
+
+    yield* harness.start;
+
+    expect(harness.startRootRun.mock.calls[0]?.[0].message.text).toBe(
+      "<pre-start-context>\nPropose a plan before editing files.\n</pre-start-context>\n\nFix the login bug",
+    );
+    expect(harness.projection().messages.at(-1)?.text).toBe("Fix the login bug");
+  }),
+);
+
+effectIt.effect("keeps a pre-start monitor's context out of a steering restart", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Fix the login bug",
+      failReadsAfterRunning: true,
+      preStart: releasedPreStart,
+      attemptReason: "steering_restart",
+    });
+
+    yield* harness.start;
+
+    expect(harness.startRootRun.mock.calls[0]?.[0].message.text).toBe("Fix the login bug");
+  }),
+);

@@ -28,6 +28,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as PreStartMonitors from "./PreStartMonitors.ts";
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
@@ -207,6 +208,9 @@ const layerCheckpointCaptureServiceProvided = CheckpointCaptureService.layer.pip
 const layerRunFinalizationServiceProvided = RunFinalizationService.layer.pipe(
   Layer.provide(Layer.merge(layerCheckpointCaptureServiceProvided, ProjectionStore.layer)),
 );
+const layerPreStartMonitorsProvided = PreStartMonitors.layer.pipe(
+  Layer.provide(Layer.merge(layerEventSinkProvided, ProjectionStore.layer)),
+);
 
 const layerOrchestratorProvided = Orchestrator.layer.pipe(
   Layer.provide(
@@ -229,6 +233,8 @@ const layerOrchestratorProvided = Orchestrator.layer.pipe(
       layerProviderSwitchServiceProvided,
       layerRunExecutionServiceProvided,
       ThreadForkService.layer,
+      // the same subscriptions the WebSocket handlers register
+      layerPreStartMonitorsProvided,
     ),
   ),
 );
@@ -346,6 +352,7 @@ const layerMcpAppRequestsProvided = McpAppRequests.layer.pipe(
 export const layer = Layer.mergeAll(
   layerCommandOutputHubProvided,
   layerOrchestratorProvided,
+  layerPreStartMonitorsProvided,
   layerMcpAppRequestsProvided,
   layerThreadManagementProvided,
   layerEffectWorkerProvided,

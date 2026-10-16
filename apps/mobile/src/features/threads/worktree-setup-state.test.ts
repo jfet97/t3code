@@ -1,7 +1,11 @@
-import { ThreadId, type WorktreeSetupSnapshot } from "@t3tools/contracts";
+import { RunId, ThreadId, type WorktreeSetupSnapshot } from "@t3tools/contracts";
 import { resolveVisibleWorktreeSetup } from "@t3tools/client-runtime/worktree-setup";
-import { describe, expect, it } from "vite-plus/test";
-import { resolveWorktreeSetupSnapshot } from "./worktree-setup-state";
+import { describe, expect, it, vi } from "vite-plus/test";
+import {
+  resolveWorktreeSetupSnapshot,
+  stopStartingThread,
+  stopThreadTarget,
+} from "./worktree-setup-state";
 
 const threadId = ThreadId.make("setup-thread");
 const running: WorktreeSetupSnapshot = {
@@ -73,5 +77,67 @@ describe("mobile worktree setup handoff", () => {
     expect(resolveWorktreeSetupSnapshot(otherId, running, running)).toBeNull();
     const other = { ...running, threadId: otherId };
     expect(resolveWorktreeSetupSnapshot(otherId, other, running)).toBe(other);
+  });
+});
+
+describe("mobile Stop while a thread starts", () => {
+  it("interrupts a held or preparing run that has no cancellable worktree setup", () => {
+    expect(stopThreadTarget(null)).toBe("run");
+    expect(stopThreadTarget({ ...running, phase: "done" })).toBe("run");
+    expect(
+      stopThreadTarget({
+        ...running,
+        stages: [
+          {
+            id: "agent",
+            status: "done",
+            startedAt: null,
+            endedAt: null,
+            percent: null,
+            detail: null,
+            tail: [],
+          },
+        ],
+      }),
+    ).toBe("run");
+  });
+
+  it("cancels a worktree setup that is still running", () => {
+    expect(stopThreadTarget(running)).toBe("worktree-setup");
+  });
+});
+
+describe("stopStartingThread", () => {
+  const knownRunId = RunId.make("known-run");
+
+  it("asks the server for the current run when it can no longer cancel the setup", async () => {
+    const interruptRun = vi.fn(async (_runId: RunId | undefined) => undefined);
+    await stopStartingThread({
+      worktreeSetup: running,
+      knownRunId,
+      cancelSetup: async () => false,
+      interruptRun,
+    });
+    expect(interruptRun.mock.calls).toEqual([[undefined]]);
+  });
+
+  it("leaves the run alone once its running setup was cancelled", async () => {
+    const interruptRun = vi.fn(async (_runId: RunId | undefined) => undefined);
+    await stopStartingThread({
+      worktreeSetup: running,
+      knownRunId: null,
+      cancelSetup: async () => true,
+      interruptRun,
+    });
+    expect(interruptRun).not.toHaveBeenCalled();
+  });
+
+  it("interrupts a held run without asking to cancel a setup, by id when one is known", async () => {
+    const cancelSetup = vi.fn(async () => true);
+    const interruptRun = vi.fn(async (_runId: RunId | undefined) => undefined);
+    await stopStartingThread({ worktreeSetup: null, knownRunId, cancelSetup, interruptRun });
+    await stopStartingThread({ worktreeSetup: null, knownRunId: null, cancelSetup, interruptRun });
+    expect(cancelSetup).not.toHaveBeenCalled();
+    expect(interruptRun.mock.calls).toEqual([[knownRunId], [undefined]]);
   });
 });

@@ -54,6 +54,10 @@ export const RPC_REQUIRED_SCOPES = {
   [ORCHESTRATION_V2_WS_METHODS.subscribeArchivedShell]: AuthOrchestrationReadScope,
   [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: AuthOrchestrationReadScope,
   [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: AuthOrchestrationReadScope,
+  // a monitor delays new threads and adds to their prompts, so both need operate
+  [ORCHESTRATION_V2_WS_METHODS.subscribePreStart]: AuthOrchestrationOperateScope,
+  [ORCHESTRATION_V2_WS_METHODS.respondPreStart]: AuthOrchestrationOperateScope,
+  [ORCHESTRATION_V2_WS_METHODS.continuePreStart]: AuthOrchestrationOperateScope,
   [ORCHESTRATION_V2_WS_METHODS.subscribeCommandOutput]: AuthOrchestrationReadScope,
   [WS_METHODS.projectsMutate]: AuthOrchestrationOperateScope,
   [WS_METHODS.serverProbe]: AuthOrchestrationReadScope,

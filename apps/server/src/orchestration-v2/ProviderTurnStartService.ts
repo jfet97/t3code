@@ -922,10 +922,19 @@ export const layer: Layer.Layer<
       const routableSubagents = projection.subagents.filter((subagent) =>
         RunExecutionService.canRouteRelatedSubagent(subagent.status),
       );
-      const userText = projectComposerContextForProvider({
+      const typedText = projectComposerContextForProvider({
         text: message.text,
         records: message.context?.records ?? [],
       });
+      // a pre-start monitor's context belongs to the first attempt, not to a steering restart
+      const preStartContext =
+        attempt.reason === "initial" && run.preStart?.status === "released"
+          ? run.preStart.context
+          : undefined;
+      const userText =
+        preStartContext === undefined
+          ? typedText
+          : `<pre-start-context>\n${preStartContext}\n</pre-start-context>\n\n${typedText}`;
       // Delivered once: this run's provider turn marks the work as told. A
       // restart continuation is prompted by its own text or resumes natively.
       const noteContinuation = isRestartNoteContinuation(

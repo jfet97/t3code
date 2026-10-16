@@ -642,6 +642,68 @@ it.effect("keeps a max-attempt replay-safe failure terminal when fail settlement
   }),
 );
 
+it.effect("keeps retrying a pre-start expiry past the attempt limit", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const effectId = "effect:worker-pre-start-expiry-retry";
+    const workerId = "worker-pre-start-expiry-retry";
+    const claimedEffect: EffectOutbox.OrchestrationEffectV2 = {
+      id: effectId,
+      commandId: CommandId.make("command:worker-pre-start-expiry-retry"),
+      threadId: ThreadId.make("thread:worker-pre-start-expiry-retry"),
+      request: {
+        type: "run.pre-start.expire",
+        runId: RunId.make("run:worker-pre-start-expiry-retry"),
+        requestId: CommandId.make("command:worker-pre-start-expiry-retry"),
+      },
+      status: "running",
+      attemptCount: 5,
+      availableAt: now,
+      leaseOwner: workerId,
+      leaseExpiresAt: now,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+      lastError: null,
+    };
+    const failures = yield* Ref.make(0);
+    const retries = yield* Ref.make(0);
+    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+      claimNext: () => Effect.succeed(Option.some(claimedEffect)),
+      get: () => Effect.succeed(Option.some(claimedEffect)),
+      awaitCancellation: () => Effect.never,
+      clearCancellation: () => Effect.void,
+      fail: () => Ref.update(failures, (count) => count + 1).pipe(Effect.as(true)),
+      retry: () => Ref.update(retries, (count) => count + 1).pipe(Effect.as(true)),
+    });
+    const layerExecutor = Layer.succeed(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      EffectWorker.OrchestrationEffectExecutorV2.of({
+        execute: () =>
+          Effect.fail(
+            new EffectWorker.OrchestrationEffectExecutionError({
+              effectId,
+              effectType: claimedEffect.request.type,
+              cause: "simulated settlement planning failure",
+            }),
+          ),
+      }),
+    );
+    const layerWorker = EffectWorker.layerWithOptions({ workerId, maxAttempts: 5 }).pipe(
+      Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+    );
+
+    assert.isTrue(
+      yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+        Effect.flatMap((worker) => worker.runOnce),
+        Effect.provide(layerWorker),
+      ),
+    );
+    assert.equal(yield* Ref.get(failures), 0);
+    assert.equal(yield* Ref.get(retries), 1);
+  }),
+);
+
 it.effect("uses durable deadlines, notifications, and a slow liveness poll", () =>
   Effect.gen(function* () {
     const attempts = yield* Ref.make(0);

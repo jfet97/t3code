@@ -214,6 +214,7 @@ import {
   OrchestrationV2GetShellSnapshotError,
   OrchestrationV2CommandOutputError,
   OrchestrationV2GetThreadProjectionError,
+  OrchestrationV2PreStartError,
   OrchestrationV2RpcSchemas,
   OrchestrationV2ThreadLaunchError,
 } from "./orchestrationV2.ts";
@@ -1702,6 +1703,31 @@ const WsOrchestrationV2SubscribeThreadRpc = Rpc.make(ORCHESTRATION_V2_WS_METHODS
   stream: true,
 });
 
+const WsOrchestrationV2SubscribePreStartRpc = Rpc.make(
+  ORCHESTRATION_V2_WS_METHODS.subscribePreStart,
+  {
+    payload: OrchestrationV2RpcSchemas.subscribePreStart.input,
+    success: OrchestrationV2RpcSchemas.subscribePreStart.output,
+    error: Schema.Union([OrchestrationV2PreStartError, EnvironmentAuthorizationError]),
+    stream: true,
+  },
+);
+
+const WsOrchestrationV2RespondPreStartRpc = Rpc.make(ORCHESTRATION_V2_WS_METHODS.respondPreStart, {
+  payload: OrchestrationV2RpcSchemas.respondPreStart.input,
+  success: OrchestrationV2RpcSchemas.respondPreStart.output,
+  error: Schema.Union([OrchestrationV2PreStartError, EnvironmentAuthorizationError]),
+});
+
+const WsOrchestrationV2ContinuePreStartRpc = Rpc.make(
+  ORCHESTRATION_V2_WS_METHODS.continuePreStart,
+  {
+    payload: OrchestrationV2RpcSchemas.continuePreStart.input,
+    success: OrchestrationV2RpcSchemas.continuePreStart.output,
+    error: Schema.Union([OrchestrationV2PreStartError, EnvironmentAuthorizationError]),
+  },
+);
+
 const WsOrchestrationV2SubscribeCommandOutputRpc = Rpc.make(
   ORCHESTRATION_V2_WS_METHODS.subscribeCommandOutput,
   {
@@ -2044,5 +2070,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SubscribeArchivedShellRpc,
   WsOrchestrationV2SubscribeShellRpc,
   WsOrchestrationV2SubscribeThreadRpc,
+  WsOrchestrationV2SubscribePreStartRpc,
+  WsOrchestrationV2RespondPreStartRpc,
+  WsOrchestrationV2ContinuePreStartRpc,
   WsOrchestrationV2SubscribeCommandOutputRpc,
 ).middleware(RpcScopeAuthorization);

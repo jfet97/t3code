@@ -557,6 +557,50 @@ describe("V2 environment commands", () => {
     }).pipe(Effect.provide(layerTestCrypto)),
   );
 
+  it.effect("stops a first message held for pre-start monitors without a known run id", () =>
+    Effect.gen(function* () {
+      const heldRunId = RunId.make("run-held");
+      const projection: OrchestrationV2ThreadProjection = {
+        ...v2Projection,
+        runs: [
+          {
+            id: heldRunId,
+            threadId: v2ThreadId,
+            ordinal: 1,
+            providerInstanceId: v2Projection.thread.providerInstanceId,
+            modelSelection: v2Projection.thread.modelSelection,
+            providerThreadId: null,
+            userMessageId: MessageId.make("message-held"),
+            rootNodeId: null,
+            activeAttemptId: null,
+            status: "preparing",
+            requestedAt: v2Now,
+            startedAt: null,
+            completedAt: null,
+            checkpointId: null,
+            contextHandoffId: null,
+          },
+        ],
+      };
+      const commands: OrchestrationV2Command[] = [];
+      const supervisor = yield* makeSupervisor({ commands, projects: [], projection });
+
+      yield* interruptThreadTurn({ threadId: v2ThreadId }).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+      );
+
+      expect(commands).toEqual([
+        {
+          type: "run.interrupt",
+          commandId: expect.any(String),
+          threadId: v2ThreadId,
+          runId: heldRunId,
+          holdQueue: true,
+        },
+      ]);
+    }).pipe(Effect.provide(layerTestCrypto)),
+  );
+
   it.effect.each([
     "waiting",
     "completed",
